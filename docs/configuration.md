@@ -75,6 +75,7 @@
 | `llm_skip_enabled` | bool | `true` | 随机轮次是否允许模型用 skip token 拒答 |
 | `llm_extra_headers` | map[string]string | `{}` | 不得覆盖 `authorization`、`content-type`、`content-length`、`host` |
 | `debug_prompts` | bool | `false` | 为 true 时以 Debug 记录完整请求/响应提示词 |
+| `vision_enabled` | bool | `false` | 开启图片识别与图片记忆；需视觉 LLM；图片记忆仍受 `memory_enabled` 控制 |
 
 #### 13.1.5 Embedding 与向量索引
 
@@ -129,7 +130,7 @@
 |---|---|---|---|
 | `jobs_run_on_start` | bool | `false` | 启动后立即各跑一次整理与清理 |
 
-未列入本表的键不是配置键。内部常量不暴露配置：`storage_timeout=2s`、`table_name="vector"`、`table_meta_key="meta"`、`table_load_timeout=30s`、`shutdown_wait_timeout=5s`、`vector_load_workers=4`、`vector_ready_timeout=2s`、`context_message_max_chars=1000`、`embedding_batch_size=16`、`embedding_max_input_chars=6000`、`knowledge_fetch_timeout=20s`、`knowledge_max_redirects=3`、`knowledge_max_chunks_per_doc=500`、`knowledge_user_agent="kei-plugin-chat-agent/0.1"`、`memory_extract_temperature=0.2`、`memory_extract_max_tokens=800`、`history_cleanup_timeout=1m`。
+未列入本表的键不是配置键。内部常量不暴露配置：`storage_timeout=2s`、`table_name="vector"`、`table_meta_key="meta"`、`table_load_timeout=30s`、`shutdown_wait_timeout=5s`、`vector_load_workers=4`、`vector_ready_timeout=2s`、`context_message_max_chars=1000`、`embedding_batch_size=16`、`embedding_max_input_chars=6000`、`knowledge_fetch_timeout=20s`、`knowledge_max_redirects=3`、`knowledge_max_chunks_per_doc=500`、`knowledge_user_agent="kei-plugin-chat-agent/0.1"`、`memory_extract_temperature=0.2`、`memory_extract_max_tokens=800`、`history_cleanup_timeout=1m`、`vision_fetch_timeout=10s`、`vision_max_images_per_request=4`、`vision_max_image_bytes=4194304`、`vision_max_redirects=3`、`vision_allowed_formats=["image/jpeg","image/png","image/gif","image/webp"]`。
 
 ### 13.2 示例配置
 
@@ -193,6 +194,7 @@ llm_skip_token: "[SKIP]"
 llm_skip_enabled: true
 llm_extra_headers: {}
 debug_prompts: false
+vision_enabled: false
 
 memory_enabled: true
 rag_enabled: true
@@ -261,6 +263,7 @@ export KEI_PLUGINS_CHAT_AGENT_LLM_MODEL="gpt-4o-mini"
 export KEI_PLUGINS_CHAT_AGENT_GROUP_POLICY="whitelist"
 export KEI_PLUGINS_CHAT_AGENT_GROUP_LIST="telegram:-100123,telegram:-100456"
 export KEI_PLUGINS_CHAT_AGENT_MEMORY_ENABLED="false"
+export KEI_PLUGINS_CHAT_AGENT_VISION_ENABLED="true"
 export KEI_PLUGINS_CHAT_AGENT_RANDOM_QUIET_HOURS="23:00-07:00"
 ```
 
@@ -325,6 +328,8 @@ knowledge_allowed_content_types 不能为空
 - `llm_api_key` 与 `embedding_api_key` 允许空串。
 - `system_prompt` 允许空串；空串使用默认模板。
 - `embedding_base_url` 为空串合法；非空时按 URL 校验。
+- `vision_enabled` 只接受布尔值；插件不探测模型能力。为 true 时 `llm_model` 必须接受 OpenAI 多模态 `content` 数组（`text` 与 `image_url` 块）；`memory_enabled=true` 时图片识别文本由 `embedding_model` 嵌入，Embeddings 请求仍只包含文本。
+- `vision_enabled=true` 且 `memory_enabled=false` 合法：图片可被识别，但不写长期记忆。`vision_enabled=false` 时不下载图片，纯图片消息按 [`participation.md §7.1`](participation.md#71-事件过滤与准入) 拒绝。
 - 任一键校验失败即返回错误，插件不装配；错误信息包含规范化前的原值。
 - 未列入 §13.1 的键不读取、不校验。
 
@@ -339,9 +344,9 @@ knowledge_allowed_content_types 不能为空
 
 ### 13.6 Metadata.Options
 
-`Metadata.Options` 必须包含 §13.1 的全部 81 个顶层键，与 [`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 的 `Options` 代码块逐项一致。核心在漏列时记录 warn，但不拒绝装配；插件仍按 §13.1 读取。任何键增删必须同时修改三处：§13.1、本节清单、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应)。
+`Metadata.Options` 必须包含 §13.1 的全部 82 个顶层键，与 [`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 的 `Options` 代码块逐项一致。核心在漏列时记录 warn，但不拒绝装配；插件仍按 §13.1 读取。任何键增删必须同时修改三处：§13.1、本节清单、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应)。
 
-以下清单是 `Metadata.Options` 的镜像，共 81 项：
+以下清单是 `Metadata.Options` 的镜像，共 82 项：
 
 ```text
 group_policy
@@ -392,6 +397,7 @@ llm_skip_token
 llm_skip_enabled
 llm_extra_headers
 debug_prompts
+vision_enabled
 memory_enabled
 rag_enabled
 embedding_base_url
@@ -436,6 +442,7 @@ jobs_run_on_start
 - `llm_extra_headers`/`embedding_extra_headers` 不得覆盖协议头；校验失败阻止启动。
 - URL 不得包含 userinfo，避免把凭据写进日志或错误消息。
 - `knowledge_url_allow_private=true` 只允许在隔离测试环境使用，生产必须保持 `false`。
+- 图片 URL 来自消息，按不可信输入处理：只允许 http(s)、禁止回环/私网/保留地址、限制重定向、单图大小与格式；`KeyFile` 不支持，插件不读本地文件。原始 URL 与 data URL 不写日志；`debug_prompts=true` 时图片折叠为 `[image <mime> <bytes>B]` 摘要。
 
 ## 相关文档
 

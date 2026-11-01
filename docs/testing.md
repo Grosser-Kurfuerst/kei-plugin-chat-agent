@@ -44,11 +44,12 @@ go test -race ./...
 | 管理员条目 | 合法 `platform:userID` 通过；缺冒号、空侧返回 `必须是 platform:userID` |
 | headers 映射 | 普通键通过；覆盖协议头返回 `不得覆盖协议请求头` |
 | 条件必填 | 两开关都关时 `embedding_model` 可为空；任一开时为空报错 |
+| 图片开关 | `vision_enabled` 默认 false；true/false 均可读取；开启不要求 `memory_enabled` |
 | 批窗口关系 | `batch_max_window < batch_window` 返回固定原因 |
 | 分块关系 | overlap 为负或 `>= chunk_chars` 返回固定原因 |
 | 内容类型 | 空列表报错；大小写与参数被规范化 |
 | 错误格式 | 首个错误包含键名、原值与原因 |
-| `Metadata.Options` | 集合与 §13.1 的 81 个键完全一致 |
+| `Metadata.Options` | 集合与 §13.1 的 82 个键完全一致 |
 
 #### 15.2.2 名单
 
@@ -88,7 +89,10 @@ go test -race ./...
 | epoch | 删除后旧 timer 触发被丢弃，reason `stale` |
 | 信号量满 | 丢弃整批并记 `semaphore_full`，不排队 |
 | 过短/命令/机器人/自身 | 分别返回 `too_short`、`command`、`bot_sender`、`self_sender` |
-| 纯非文本 | 返回 `empty_text`，不记录 |
+| 纯非文本（vision 关闭） | 返回 `empty_text`，不记录 |
+| 纯图片（vision 开启） | 进入历史，`Text=[图片]`，`Images` 保留 URL |
+| 图片与 `trigger_min_chars` | 含可用图片的消息跳过文本长度检查 |
+| `KeyFile` 图片 | 不进入 `Images`；纯 `KeyFile` 消息返回 `empty_text` |
 
 #### 15.2.4 历史
 
@@ -98,6 +102,8 @@ go test -race ./...
 | 字符裁剪 | 总 rune 超限时从最旧裁剪，`lostSeq` 只覆盖未整理部分 |
 | 序号 | 首条 `Seq=0`，每次追加递增，机器人回复也递增 |
 | 占位符 | 图片/表情/文件/卡片/引用/未知段映射为固定占位符 |
+| 图片字段 | vision 开启时 `Images` 按出现顺序保存 URL；关闭时为空 |
+| 图片预算 | 图片 URL 不计入 `history_max_chars` / `context_max_chars` |
 | TTL | 空闲超过 `history_ttl` 且已整理的会话被删除 |
 | `history_ttl=0` | 不按空闲删除，LRU 与硬上限仍生效 |
 | 未整理保护 | 未整理会话不被普通 TTL 删除 |
@@ -120,6 +126,10 @@ go test -race ./...
 | 预算 | 条数与字符上限生效；单条截断 1000 rune |
 | 记忆块 | 有结果时格式逐字匹配；无结果整块省略 |
 | 知识库块 | 有结果时格式逐字匹配；无结果整块省略 |
+| 视觉关闭 | `user.content` 为字符串，图片只保留 `[图片]` |
+| 视觉开启 | `user.content` 为 parts；`image_url` 为 data URL，顺序与占位符一致 |
+| 图片上限 | 单次最多 4 张；下载失败不占名额，继续尝试更旧图片 |
+| 图片失败 | 保留占位符，文本部分正常生成 |
 | 清洗 | `<`/`>` 转 `‹`/`›`，控制字符转空格 |
 | skip token | 独立出现时被移除；清空后不发送 |
 | 回复清洗 | CRLF 归一、3 个以上换行压成 2 个、去首尾空白 |
@@ -137,6 +147,9 @@ go test -race ./...
 | Chat 缺 choices | 返回 `invalid_shape` |
 | Chat content 非字符串 | 数组/对象/null 均返回 `invalid_shape` |
 | Chat 空内容 | 返回错误，不进入发送 |
+| Chat 视觉请求 | `image_url.url` 为 data URL；不包含原始图片 URL；最多 4 张 |
+| Chat 视觉模型不支持 | 含图请求返回 4xx 时映射 `llm_error`，不回退纯文本 |
+| Chat 多模态响应 | `content` 为数组/对象时返回 `invalid_shape` |
 | Chat 超时/取消 | 超时按配置重试；取消立即返回 |
 | skip token | 随机轮次识别；寻址轮次不识别 |
 | Embedding 正常 | 按 `index` 排序后顺序与输入一致 |
@@ -147,6 +160,7 @@ go test -race ./...
 | Embedding 零向量 | 返回 `invalid_vector` |
 | Embedding 批量 | 16 条一批；空输入不发请求 |
 | Embedding 截断 | 单条超过 6000 rune 被截断 |
+| Embedding 图片 | 请求只含文本；图片识别文本正常嵌入，请求不含 `image_url` |
 | headers 禁改 | 覆盖协议头在配置校验期失败 |
 
 #### 15.2.7 向量索引
@@ -202,6 +216,13 @@ go test -race ./...
 | 强化落库 | 下一轮整理写入批量更新；失败保留内存值 |
 | 记忆命令 | status/search/add/del/reset 的输出与副作用 |
 | 未启用 | 所有记忆命令输出未启用文案 |
+| 图片抽取 | vision 开启时附加 `image_url`；识别文本写入普通 `m:` 行 |
+| 图片分批 | 每批最多 4 张；全部批次成功后水位推进 |
+| 图片批失败 | 任一批 LLM/Embedding/写行失败时水位不推进，重试幂等 |
+| 图片下载失败 | 保留占位符，批次不失败，水位可推进 |
+| 图片全部失败 | 按空抽取成功处理，水位推进 |
+| vision 关闭 | 抽取不附加图片、不下载图片 |
+| reindex 图片记忆 | 用 `text` 重嵌入，不重新下载图片 |
 
 #### 15.2.9 知识库
 
@@ -251,14 +272,34 @@ go test -race ./...
 | 关闭 | Stop 取消 ticker、任务、生成与 Embedding |
 | 双重 Stop | 第二次直接返回，不 panic |
 
+#### 15.2.11 图片
+
+| 用例 | 可观察断言 |
+|---|---|
+| 关闭态 | `vision_enabled=false` 时不发起图片请求；纯图片消息 `empty_text` |
+| URL scheme | 非 http(s)、缺 host、带 userinfo 的图片 URL 被跳过 |
+| 私网地址 | 回环、10/8、127/8、169.254/16、CGNAT、保留段等全部拒绝 |
+| 重定向 | 每跳重新校验；超过 `vision_max_redirects=3` 失败并记 `reason=redirect` |
+| 状态码 | 非 200 跳过并记 `reason=status` |
+| Content-Type | 非 `image/*` 时用 `DetectContentType` 兜底；仍非图片则跳过 |
+| 大小限制 | 超过 4 MiB 跳过并记 `reason=too_large` |
+| 格式白名单 | 不在允许集合的图片跳过并记 `reason=format` |
+| 超时 | 批量下载共用 10s；ctx 取消优先 |
+| 编码 | 成功图片编码为 `data:<mime>;base64,...`，不保留原始 URL |
+| 数量上限 | 每批最多 4 张成功图片；超出的保留占位符 |
+| `KeyFile` | 不下载、不进入 `Images` |
+| 日志 | 只记 `reason`/`host`/`bytes`，不记完整 URL 或 base64 |
+| debug 折叠 | `debug_prompts=true` 时图片只记 `[image <mime> <bytes>B]`，不含 base64 |
+
 ### 15.3 测试注入缝
 
 | 注入点 | 类型 | 用途 |
 |---|---|---|
 | `now` | `func() time.Time` | 衰减、TTL、冷却、静默时段 |
 | `randFloat` | `func() float64` | 概率边界 |
-| `chatCompleter` | 接口 | 固定回复、错误、超时、非法 JSON |
+| `chatCompleter` | 接口 | 固定回复、错误、超时、非法 JSON、多模态请求断言 |
 | `embedder` | 接口 | 固定维度向量、维度错误、零向量 |
+| `visionClient` | `*http.Client` | 图片下载；测试替换为 `httptest.Server.Client()` 绕过地址限制 |
 | `knowledgeFetcher` | 接口 | URL 校验、重定向、Content-Type、大小 |
 | `Storage` | 接口 | 内存 fake、写失败、读超时 |
 | `Tables` | 接口 | 表 fake：`CreateTable`/`ListRows` 错误、`bot.ErrRowExists`、`bot.ErrTableNotFound`、行读写失败 |
@@ -281,7 +322,7 @@ go test -race ./...
 - 空导入 `github.com/RandomLemon/kei/adapters/mock`。
 - 使用 SQLite 时空导入 `github.com/RandomLemon/kei/pkg/kei/sql`，配置 `storage.type: sqlite`。
 - 启动本地 Chat 与 Embedding 桩服务：Chat 返回固定文本；Embedding 返回固定维度向量。
-- 配置 `group_policy=whitelist`、`group_list=[g9]`、`private_policy=open`、`self_ids=[bot]`、`super_admins=[platform:admin]`、`memory_enabled=true`、`rag_enabled=true`。
+- 配置 `group_policy=whitelist`、`group_list=[g9]`、`private_policy=open`、`self_ids=[bot]`、`super_admins=[platform:admin]`、`memory_enabled=true`、`rag_enabled=true`、`vision_enabled=true`。
 - 预置一条记忆与一条知识：管理员执行 `/chat memory add` 与 `/chat knowledge add-text`，等待完成。
 
 场景：
@@ -293,6 +334,7 @@ go test -race ./...
 5. 知识库：执行 `/chat knowledge add-text`，断言 `vector` 表出现 `d:` 与 `c:` 行且 `chunk_ids` 引用它们；注入查询消息，断言知识块命中；执行 `/chat knowledge list`，断言文档与分块计数。
 6. 清理：配置短 `history_ttl` 与长 `history_unconsolidated_ttl`；注入历史后等待空闲，执行 `/chat jobs run cleanup`，断言已整理空闲会话消失、未整理会话仍受硬 TTL 保护。
 7. 管理员：super_admin 执行 `/chat policy` 并重启，断言覆盖保留；核心管理员执行 `/chat-admin status` 成功；非管理员执行 `/chat` 得到 `chat-agent: 无权执行该命令`。
+8. 图片识别与记忆：通过 `visionClient` 注入固定 PNG；注入含 `SegImage` 的群消息，断言 Chat 桩收到 `content` parts 且含 `data:image/png;base64,...`；执行 `/chat jobs run consolidate`，断言 `vector` 表新 `m:` 行的 `text` 含固定识别描述；重启后执行 `/chat memory search`，断言该记忆可检索。
 
 断言要求：
 
@@ -308,6 +350,7 @@ go test -race ./...
   - 生成中调用 `Stop`：不再发送，`wg` 在 5s 内归零。
   - Embedding 中调用 `Stop`：请求 ctx 取消，任务返回。
   - 知识库抓取中调用 `Stop`：抓取 ctx 取消，不写半成品。
+  - 图片下载中调用 `Stop`：下载 ctx 取消，不发送、不写记忆，`wg` 归零。
   - 写队列有积压时 `Stop`：队列排空后取消，已提交写入保留。
   - 索引异步构建中调用 `Stop`：构建 ctx 取消，`wg` 归零，`state` 不进入 `ready`，不发送消息。
   - `Stop` 后调用 `Send` 的路径必须被拒绝，测试断言发送计数不增加。
@@ -356,7 +399,7 @@ grep -RIn "chat-agent: 存储表加载失败" docs
 
 - `docs/README.md` 索引表与磁盘文件一一对应。
 - 所有 Markdown 文件链接目标存在；所有 `#anchor` 能在目标文件标题中找到。
-- [`configuration.md §13.1`](configuration.md#131-权威配置键表)、§13.6、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 三处键集合一致，共 81 项。
+- [`configuration.md §13.1`](configuration.md#131-权威配置键表)、§13.6、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 三处键集合一致，共 82 项。
 - 每个 `docs/*.md` 有“覆盖/不覆盖”开头与“相关文档”结尾。
 - 不出现 `go.mod`、`.go`、测试或脚本文件。
 

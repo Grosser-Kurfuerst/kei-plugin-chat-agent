@@ -9,16 +9,16 @@
 | 文件 | 章号 | 内容 |
 |---|---|---|
 | `README.md` | — | 索引、阅读顺序、文档约定 |
-| [`architecture.md`](architecture.md) | 1-6 | 定位与边界、架构与数据流、生命周期与并发、状态与持久化、Storage 与表存储、目录与文件职责、与 kei 契约 |
-| [`participation.md`](participation.md) | 7 | 事件过滤、寻址、随机参与、批处理、决策伪代码、reason 词表、名单策略 |
-| [`conversation.md`](conversation.md) | 8 | 会话状态、历史记录、上下文渲染、缓存清理、重启语义 |
-| [`memory.md`](memory.md) | 9 | 长期记忆数据模型、抽取、合并、整理、检索、注入、管理 |
+| [`architecture.md`](architecture.md) | 1-6 | 定位与边界（含可选图片识别）、架构与数据流、生命周期与并发、状态与持久化、Storage 与表存储、目录与文件职责、与 kei 契约 |
+| [`participation.md`](participation.md) | 7 | 事件过滤（含图片准入）、寻址、随机参与、批处理、决策伪代码、reason 词表、名单策略 |
+| [`conversation.md`](conversation.md) | 8 | 会话状态、历史记录、图片占位与多模态上下文、缓存清理、重启语义 |
+| [`memory.md`](memory.md) | 9 | 长期记忆数据模型、抽取、合并、整理、检索、注入、图片识别文本记忆、管理 |
 | [`rag.md`](rag.md) | 10 | 知识库导入、抓取、分块、索引、检索、注入、双库边界 |
 | [`vector-index.md`](vector-index.md) | 11 | TableStorage 表、写入协议、top-k、重建、容量、故障 |
-| [`llm.md`](llm.md) | 12 | Chat/Embedding 协议、超时重试、限额、安全、兼容服务 |
-| [`configuration.md`](configuration.md) | 13 | 权威配置键表、示例、环境变量、校验规则 |
+| [`llm.md`](llm.md) | 12 | Chat/Embedding 协议（Chat 视觉内容块、Embedding 文本）、超时重试、限额、安全、兼容服务 |
+| [`configuration.md`](configuration.md) | 13 | 权威配置键表（含图片开关）、示例、环境变量、校验规则 |
 | [`admin.md`](admin.md) | 14 | 超级管理员与核心管理员、命令面、输出、持久化、审计 |
-| [`testing.md`](testing.md) | 15 | 质量门、单测矩阵、注入缝、mock 适配器端到端、竞态与关闭、文档校验 |
+| [`testing.md`](testing.md) | 15 | 质量门、单测矩阵（含图片）、注入缝、mock 适配器端到端、竞态与关闭、文档校验 |
 | [`roadmap.md`](roadmap.md) | 16 | 交付状态、P1-P8、已知缺口、假设与兜底 |
 
 ## 阅读顺序

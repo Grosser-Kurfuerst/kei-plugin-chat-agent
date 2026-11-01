@@ -12,6 +12,7 @@
 - 每会话有界的内存历史，按条数、字符数、空闲时间与 LRU 清理。
 - 基于内置向量索引的长期记忆：定时抽取、合并、衰减、淘汰、检索与提示词注入。
 - 基于内置向量索引的知识库 RAG：URL/文本导入、抓取、分块、嵌入、检索与注入。
+- 可选的图片识别与图片记忆：`vision_enabled=true` 时从 `SegImage` 下载图片并作为多模态输入交给视觉 LLM；识别出的文本可由记忆整理写入长期记忆。
 - 两个后台任务：记忆整理与消息缓存清理。
 - 插件级超级管理员命令，与宿主核心管理员命令并存。
 
@@ -28,7 +29,7 @@
 
 ### 1.4 不做什么
 
-不支持外部向量数据库（Qdrant、Milvus、pgvector）；不做平台协议实现、本地文件导入、视觉理解、流式输出、MCP/工具调用、LLM SDK、kei 核心改动；只处理 `bot.MessageGroup` 与 `bot.MessagePrivate`，不处理 `bot.MessageChannel`。
+不支持外部向量数据库（Qdrant、Milvus、pgvector）；不做平台协议实现、本地文件导入、图片生成、图片发送、图片向量检索、流式输出、MCP/工具调用、LLM SDK、kei 核心改动；只处理 `bot.MessageGroup` 与 `bot.MessagePrivate`，不处理 `bot.MessageChannel`。`vision_enabled=false` 时图片只映射为 `[图片]` 占位符；开启后图片仅以视觉 LLM 的识别结果（文本）进入长期记忆，原始图片不写入 Storage。
 
 ### 1.5 当前交付物
 
@@ -58,6 +59,8 @@ kei EventBus ──► Engine ──► Router
                              ▼
                   后台生成协程（全局信号量）
                              ▼
+            图片下载与多模态内容组装（vision_enabled）
+                             ▼
                  RAG 检索（记忆 + 知识库）
                              ▼
                      Chat Completions (LLM)
@@ -71,6 +74,7 @@ kei EventBus ──► Engine ──► Router
 
 - Handler 路径只做内存判断与状态更新，毫秒级返回；不做网络、LLM、Embedding 或 Storage 同步读取。
 - 后台路径承担批处理等待、RAG、LLM、发送、记忆整理、知识库导入与清理。
+- `vision_enabled=true` 时图片下载与多模态组装在生成/整理后台路径执行；Handler 只记录 `SegImage` 的 `KeyURL`，不发起下载。
 - Handler 阻塞会拖慢同一会话并受宿主 `RuleTimeout`/`EventTimeout` 约束；因此所有慢操作必须离开 Handler。
 - 名单拒绝发生在建会话状态之前：被拒绝的消息不产生会话、不进历史、不触发任何后台任务。
 
@@ -79,7 +83,8 @@ kei EventBus ──► Engine ──► Router
 | 组件 | 数量 | 职责 |
 |---|---|---|
 | 批处理定时器 | 每会话最多 1 个 | 合并短时间内的连续消息，触发一次生成 |
-| 生成协程 | 每会话最多 1 个，全局受 `limits_max_concurrent` 限制 | RAG、LLM、清洗、发送 |
+| 生成协程 | 每会话最多 1 个，全局受 `limits_max_concurrent` 限制 | 图片下载、RAG、LLM、清洗、发送 |
+| 图片下载与组装 | 随生成/整理协程，单批最多 4 张 | 从 `SegImage.KeyURL` 下载、SSRF 校验、大小/格式限制、data URL 编码；失败降级 `[图片]` |
 | Embedding 工作协程 | 1 个，队列容量 64 | 记忆整理与知识库导入的批量嵌入 |
 | Storage 单写协程 | 1 个 | 串行执行全部 KV 与 `vector` 表行写入 |
 | 记忆整理任务 | 1 个 | 抽取、合并、衰减、容量淘汰 |
@@ -96,7 +101,8 @@ kei EventBus ──► Engine ──► Router
 | `policy` | 配置、`policy` 键、命令 | 允许/拒绝 | 非法覆盖回落配置并 warn |
 | `history` | 允许的消息、机器人回复 | 有界历史、上下文 | 裁剪时记录 `lostSeq` |
 | `decision` | 事件、名单、会话状态 | 批处理计划、reason | 拒绝只记日志 |
-| `prompt` | 历史、记忆块、知识库块 | Chat messages | 渲染失败使用空块 |
+| `prompt` | 历史、记忆块、知识库块、图片 | Chat messages（字符串或多模态 parts） | 渲染失败使用空块；图片缺失保留占位符 |
+| `vision` | `SegImage` URL、历史图片 | data URL、多模态 parts | 单图失败保留占位符，不阻塞文本 |
 | `rag` | 查询文本、两个 collection | 注入块、`rag_status` | 降级为不注入 |
 | `memory` | 未整理历史、查询向量 | 记忆记录、检索结果 | 保留水位，下轮重试 |
 | `knowledge` | URL/文本 | 文档与分块行 | 旧文档保留，未引用块由启动回收 |
@@ -113,9 +119,9 @@ kei EventBus ──► Engine ──► Router
 
 1. 从核心接收 `PluginContext` 并保存在插件实例上。
 2. 调用 `loadConfig` 读取并校验全部配置；任何校验错误返回 `chat-agent: 配置错误 <key>=<值>: <原因>`，插件不装配。
-3. 检查 `PluginContext.HTTPClient != nil`；为 nil 时返回 `chat-agent: 需要 network 权限`，因为 Chat 与 Embedding 都依赖 HTTP。
+3. 检查 `PluginContext.HTTPClient != nil`；为 nil 时返回 `chat-agent: 需要 network 权限`，因为 Chat、Embedding 与图片下载都依赖 HTTP。非 nil 时从宿主 transport 派生受限图片下载客户端（`vision.go`），不修改宿主客户端。
 4. 检查 `PluginContext.Tables != nil`；`memory_enabled || rag_enabled` 时为 nil 返回 `chat-agent: 需要 TableStorage 支持`，插件不装配。两个开关都关闭时不要求表能力，插件只用 KV 运行聊天。
-5. 构造 runtime：会话表、名单、管理员、向量索引、写队列、任务状态。
+5. 构造 runtime：会话表、名单、管理员、向量索引、写队列、任务状态、图片下载客户端。
 6. 注册 4 条规则：
 
 ```go
@@ -179,6 +185,7 @@ reg.OnCommand("chat-admin", p.handleCommand,
 | 记忆整理任务 | 1 | try-lock，未结束则 `job_busy` |
 | 缓存清理任务 | 1 | try-lock，未结束则 `job_busy` |
 | 知识库任务 | 1 | 全局串行，忙碌返回 `busy` |
+| 图片下载 | 每批最多 `vision_max_images_per_request=4` 张 | 在生成/整理协程内同步执行；批量超时 `vision_fetch_timeout=10s`；失败降级占位符 |
 | ticker | 2 | 记忆整理、缓存清理 |
 
 ### 3.3 锁与所有权
@@ -221,7 +228,7 @@ reg.OnCommand("chat-admin", p.handleCommand,
 
 | 字段 | 含义 |
 |---|---|
-| `operation` | `message`、`generate`、`admin_command`、`consolidate`、`cleanup`、`knowledge`、`vector`、`storage` |
+| `operation` | `message`、`generate`、`admin_command`、`consolidate`、`cleanup`、`knowledge`、`vector`、`vision`、`storage` |
 | `reason` | 决策 reason 或失败原因 |
 | `rag_status` | `ok`、`disabled`、`loading`、`error`、`empty` |
 | `session` | 会话键的哈希前缀 |
@@ -233,7 +240,7 @@ reg.OnCommand("chat-admin", p.handleCommand,
 | `duration_ms` | 耗时 |
 | `error` | 错误字符串 |
 
-`plugin=chat-agent` 由核心绑定。禁止记录 API key；只有 `debug_prompts=true` 才记录完整请求/响应提示词。
+`plugin=chat-agent` 由核心绑定。禁止记录 API key；只有 `debug_prompts=true` 才记录完整请求/响应提示词。`operation=vision` 只记录 `reason`、`host`、`bytes`，不记录完整 URL 或 data URL；`debug_prompts=true` 时图片折叠为 `[image <mime> <bytes>B]`。
 
 ## 4. 状态与持久化
 
@@ -335,6 +342,7 @@ KV 逻辑键（全部）：
 - `m`/`d`/`c` 记录内的 `id` 与行键后缀一致，是 32 位小写 hex（SHA-256 前 16 字节）。
 - 会话键哈希：`SHA-256(platform + "\x00" + botID + "\x00" + channelKey)` 的 64 位小写 hex；私聊 `channelKey = "user:" + userID`，群聊为频道 ID。
 - 记忆 ID = `SHA-256(scope + "\x00" + scope_key + "\x00" + normalized_text)` 前 16 字节。
+- 图片识别后的记忆仍是普通 `m:` 行，`text` 是视觉 LLM 输出；表中不存图片二进制、原始 URL 或图片向量。
 - 文档 ID = `SHA-256(normalized_source)` 前 16 字节；`normalized_source` 为 URL 原样去首尾空白，或 `text:<正文>`。
 - 分块 ID = `SHA-256(doc_id + "\x00" + index + "\x00" + chunk_text)` 前 16 字节。
 
@@ -403,8 +411,9 @@ KV 逻辑键（全部）：
 | `history.go` | `Turn`、历史环、裁剪、清理任务 |
 | `decision.go` | 过滤、寻址、随机、批处理、生成调度 |
 | `prompt.go` | 模板渲染、历史/本轮渲染、清洗、去重 |
-| `llm.go` | Chat Completions 客户端、重试、JSON 抽取 |
-| `embedding.go` | Embeddings 客户端、批量、校验 |
+| `llm.go` | Chat Completions 客户端、多模态 content parts、重试、JSON 抽取 |
+| `vision.go` | 图片 URL 校验、SSRF 安全下载、大小/格式/重定向上限、data URL 编码 |
+| `embedding.go` | Embeddings 客户端、批量、校验（只接收文本） |
 | `vector.go` | 表行编码、内存索引、top-k、文档提交与行写入协议 |
 | `memory.go` | 抽取、合并、衰减、容量、检索 |
 | `knowledge.go` | URL 抓取、HTML 提取、分块、文档管理 |
@@ -488,6 +497,7 @@ Options: []string{
     "llm_skip_enabled",
     "llm_extra_headers",
     "debug_prompts",
+    "vision_enabled",
     "memory_enabled",
     "rag_enabled",
     "embedding_base_url",

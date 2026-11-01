@@ -13,6 +13,7 @@
 - 表单次 `ListRows` 返回全部行；无分页、列 schema、TTL、事务。
 - 单机内存索引，可见规模上限 `vector_max_records`；超过上限按淘汰或拒绝处理，不静默扩容。
 - 支持两个 collection：`memory` 与 `knowledge`，共用同一套行写入协议和查询算法。
+- 索引只存文本向量。图片记忆以视觉 LLM 识别文本的普通 `m:` 行参与检索；不存图片二进制、原始 URL 或图片向量。
 - 启动异步加载；加载完成前聊天可以使用，但 RAG 跳过并记 `rag_status=loading`。
 
 ### 11.2 数据结构
@@ -23,7 +24,7 @@
 |---|---|---|
 | `ID` | string | 32 位小写 hex |
 | `Collection` | string | `memory` 或 `knowledge` |
-| `Text` | string | 原始文本，用于重建与 reindex |
+| `Text` | string | 原始文本，用于重建与 reindex；图片记忆为识别描述 |
 | `Vector` | `[]float32` | 已 L2 归一化 |
 | `Dims` | int | 维度 |
 | `Model` | string | 生成向量的模型 |
@@ -150,7 +151,7 @@ vector: state=<ready|loading|disabled> model=<model> dims=<n> memory=<n> knowled
 处理：
 
 - stale 行保留在表中且计入容量，但不参与检索。
-- `/chat vector reindex` 只处理 stale 行：用行内 `text` 重新嵌入，更新同 ID 行的 `vector`、`dims`、`model`。
+- `/chat vector reindex` 只处理 stale 行：用行内 `text` 重新嵌入，更新同 ID 行的 `vector`、`dims`、`model`。图片记忆也只重嵌入识别文本，不重新下载图片或请求图片 Embedding。
 - 全部 stale 处理成功后写 `meta`（`version=1`、当前 `embedding_model` 与维度）；部分失败时保留旧 `meta`，失败行保持 stale。
 - 没有 stale 时输出 `vector: 完成 reindexed=0`，不写 `meta`。
 - reindex 期间新写入使用当前配置模型；本次快照不覆盖新写入。

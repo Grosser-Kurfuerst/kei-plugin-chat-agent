@@ -5,7 +5,7 @@
 ## 1. 项目定位
 
 - 插件名 `chat-agent`；Go module `github.com/RandomLemon/kei-plugin-chat-agent`；根包名 `chatagent`。
-- kei 的进程内插件：处理群聊/私聊消息，提供名单控制、短期历史、长期记忆、知识库 RAG、两个定时任务与超级管理员命令。
+- kei 的进程内插件：处理群聊/私聊消息，提供名单控制、短期历史、长期记忆、知识库 RAG、可选图片识别与图片记忆、两个定时任务与超级管理员命令。
 - 宿主通过 `plugins.chat-agent.enabled: true` 启用，并在 main 包空导入本模块。
 - 项目边界见 [`docs/architecture.md §1`](docs/architecture.md#1-项目定位与边界)；交付状态见 [`docs/roadmap.md §16.1`](docs/roadmap.md#161-现状)。
 
@@ -30,6 +30,7 @@
 ### 2.3 运行时契约
 
 - 所有阻塞操作必须带 `context.Context`；消息 Handler 必须毫秒级返回，网络与 LLM 调用放在后台协程。
+- 图片只从 `SegImage.KeyURL` 经宿主 `HTTPClient` 在后台下载；`KeyFile` 不支持，禁止读本地文件。下载必须限制 http(s)、回环/私网/保留地址、重定向、大小与格式，失败降级为 `[图片]` 占位符。原始 URL 与 data URL 不写日志。
 - `PluginContext` 只在 `Setup` 捕获并挂在插件实例上；Handler 的 ctx 没有 `PluginContext`。
 - `Start(ctx)` 的 ctx 在返回后立即取消；插件级 ctx 必须是 `context.WithCancel(context.WithoutCancel(ctx))`，由 `Stop` 取消。
 - 所有 goroutine 必须能被 `Stop` 终止；等待使用实例持有的 `sync.WaitGroup`。

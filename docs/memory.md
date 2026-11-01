@@ -27,12 +27,15 @@
 
 `normalized_text` 定义为：去首尾空白，并把内部连续空白（空格、制表符、换行）压成单个空格。存储的 `text` 保留原始清洗结果，不因 ID 归一化而改写。
 
+`text` 可以是视觉 LLM 对图片的识别描述；图片二进制、原始 URL 与图片向量都不写入 `m:` 行。图片记忆不是独立记录类型，仍按本节字段与 ID 规则存储。
+
 ### 9.2 抽取
 
 抽取只在记忆整理任务中发生，调用 `llm_model`，不使用 tools。提示词逐字固定：
 
 ```text
 你是记忆整理器。阅读下面的对话，抽取值得长期记住的信息。
+如果消息包含图片，图片内容同样属于对话内容；把图片中值得长期记住的信息写入 text，不要只写“用户发了一张图片”。
 只输出 JSON，不要解释。格式：
 {"memories":[{"text":"...","kind":"fact|preference|relationship|commitment|event","importance":0.0}]}
 规则：
@@ -55,9 +58,11 @@
 
 约束：
 
-- 最多 `memory_consolidate_max_messages` 条消息；每条截断到 1000 rune。
+- 最多 `memory_consolidate_max_messages` 条消息；每条截断到 1000 rune；图片不占 rune 预算。
+- `vision_enabled=true` 时，消息中的 `[图片]` 与附加的多模态 `image_url` 块按出现顺序对应；单次抽取最多 4 张图片，分批规则见 §9.9。文本截断可能移除占位符，图片仍按原消息顺序附加。`vision_enabled=false` 时不附加图片，图片内容不参与抽取。
+- 图片下载失败只保留 `[图片]` 文本，不使抽取失败。
 - `temperature=0.2`、`max_tokens=800`，无 tools。
-- 使用 `llm_model`，整体受 `memory_consolidate_timeout` 约束。
+- 使用 `llm_model`，整体受 `memory_consolidate_timeout` 约束。`vision_enabled=true` 时 `llm_model` 必须支持多模态 `content`；否则抽取返回 `llm_error`，水位不推进。
 - `memory_enabled=false` 时不抽取、不整理、不检索。
 - `memory_extract_max=0` 时不调用 LLM，直接把本批消息水位推进（视为无记忆）。
 - 未整理消息数少于 `memory_extract_min_messages` 时不调用 LLM，也不推进水位。
@@ -79,7 +84,7 @@
 
 ### 9.3 嵌入与合并
 
-- 每条合法记忆文本按 `embedding_batch_size=16` 批量嵌入；单条输入截断到 `embedding_max_input_chars=6000` rune。
+- 每条合法记忆文本按 `embedding_batch_size=16` 批量嵌入；单条输入截断到 `embedding_max_input_chars=6000` rune。图片识别出的记忆同样按 `text` 嵌入，图片本身不发送到 Embeddings 接口；`embedding_model` 只需支持文本。
 - 嵌入失败（超时、非 2xx、维度不符、NaN、零向量）整批判失败，不写任何记录，不推进水位。
 - 合并前按 `scope` 检索同 scope 的 top-1：
   - 余弦相似度 `>= memory_dedupe_threshold` 时合并到已有 ID。
@@ -108,12 +113,13 @@
 
 1. 选出 `consolidatedSeq < lastSeq` 的会话（`lastSeq` 即会话的 `seq`），按最久未活跃排序，最多 `memory_consolidate_max_sessions` 个。
 2. 每个会话取最老的 `memory_consolidate_max_messages` 条未整理消息。
-3. 调用抽取；消息数不足 `memory_extract_min_messages` 时跳过该会话，不推进水位。
-4. 批量嵌入合法记忆。
-5. 与同 scope 的已有记忆合并或插入。
-6. 写 `m:` 行；全部成功后推进水位。
-7. 单个会话失败不阻塞其它会话；本轮结束时汇总 `sessions_done`、`sessions_failed`、`memories_added`、`memories_merged`。
-8. 全部会话处理完后执行衰减与过期删除。
+3. 消息数不足 `memory_extract_min_messages` 时跳过该会话，不推进水位。
+4. `vision_enabled=true` 时按 §9.9 把消息切成抽取批，每批下载并附加最多 4 张图片；逐批调用抽取。`vision_enabled=false` 时整批调用一次抽取。
+5. 批量嵌入合法记忆。
+6. 与同 scope 的已有记忆合并或插入。
+7. 写 `m:` 行；全部批次成功后推进水位。
+8. 单个会话或单个抽取批失败不阻塞其它会话；本轮结束时汇总 `sessions_done`、`sessions_failed`、`memories_added`、`memories_merged`。
+9. 全部会话处理完后执行衰减与过期删除。
 
 衰减与删除：
 
@@ -143,7 +149,7 @@ operation=consolidate duration_ms=18420 sessions_done=3 sessions_failed=0 memori
 
 ### 9.5 检索
 
-- 查询文本 = 本批所有用户文本按 `seq` 拼接，截断到 1000 rune。
+- 查询文本 = 本批所有用户文本按 `seq` 拼接，截断到 1000 rune。图片不参与查询向量；图片记忆通过识别文本被检索，没有独立图片 collection 或图片查询。
 - 检索范围：
   - 群聊：本频道 `scope=channel` 的记忆 + 本批每个发送者的 `scope=user` 记忆。
   - 私聊：发送者的 `scope=user` 记忆。
@@ -217,7 +223,21 @@ operation=consolidate duration_ms=18420 sessions_done=3 sessions_failed=0 memori
 - 内存中的强化计数可能尚未落库；重启后以 Storage 中的值为准。
 - 启动时用 `ListRows` 读取 `vector` 表，按 `m:` 行重建内存索引。
 - `m:` 行的持久性取决于 Storage 后端；`memory` 后端重启后全部丢失，`sqlite`/`mysql` 保留。
+- 图片识别文本随 `m:` 行持久化；原始图片 URL 只存在于内存历史，重启后丢失，不能据此重新识别或重建图片记忆。
 - Embedding 模型或维度变化会把记录标记为 stale；重建见 [`vector-index.md §11.6`](vector-index.md#116-模型与维度变更)。
+
+### 9.9 图片记忆
+
+- 启用条件：`vision_enabled=true` 且 `memory_enabled=true`。`vision_enabled=false` 时图片不进入历史或抽取；`memory_enabled=false` 时图片可被识别，但不写长期记忆。
+- 来源：未整理历史中的 `Turn.Images`。每张图片在 `Turn.Text` 中有对应的 `[图片]` 占位符；`KeyFile` 不进入 `Turn.Images`。
+- 识别：整理任务下载图片，按消息顺序作为 `image_url` 块附加到抽取请求；视觉 LLM 输出普通记忆 JSON，`text` 是图片中可长期复用信息的描述。提示词见 §9.2。
+- 存储：仍是 `m:<id32>` 行；`text` 4..500 rune；`sources` 记录来源事件 ID。不存原始图片、URL、base64、MIME、尺寸或图片向量。
+- 嵌入与检索：识别文本按 §9.3 嵌入，图片不发送到 Embeddings；检索按文本查询，图片记忆与文本记忆共用同一 collection、ID 空间与分数。
+- 分批：未整理消息按顺序切成抽取批，每批最多 `memory_consolidate_max_messages` 条且最多 4 张成功下载的图片；文本消息可留在任一批。单条消息超过 4 张时只附加前 4 张，其余只保留 `[图片]` 并记 `reason=limit`。
+- `memory_extract_min_messages` 按本轮选中的消息总数判断；不足时不拆分、不调用 LLM、不推进水位。
+- 水位：全部批次成功写行后，水位推进到本轮最后一条已处理消息的 `Seq+1`；任一批 LLM、Embedding 或写行失败保留水位，下一轮重试；确定性 ID 保证幂等。
+- 失败：URL 非法、下载失败、超时、非图片、格式不允许或超过 4 MiB 时跳过该图，保留占位符，不使批次失败。图片全部失败且没有可抽取文本时，按空抽取成功处理，水位可推进。
+- 关闭：`vision_enabled=false` 时纯图片消息不进入历史；混合消息只保留 `[图片]`；整理不下载图片。
 
 ## 相关文档
 
@@ -225,5 +245,7 @@ operation=consolidate duration_ms=18420 sessions_done=3 sessions_failed=0 memori
 - 向量索引与容量：[`vector-index.md §11.5-11.7`](vector-index.md#115-查询算法)。
 - 知识库与预算：[`rag.md §10.6-10.7`](rag.md#106-检索与融合)。
 - 命令输出：[`admin.md §14.3`](admin.md#143-子命令与输出)。
+- 图片选择与多模态渲染：[`conversation.md §8.3`](conversation.md#83-上下文渲染)。
+- 视觉 Chat 请求：[`llm.md §12.1`](llm.md#121-chat-completions)。
 - 配置键：[`configuration.md §13.1`](configuration.md#131-权威配置键表)。
 - 测试矩阵：[`testing.md §15.2`](testing.md#152-单元测试矩阵)。

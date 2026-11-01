@@ -34,6 +34,7 @@
 | `UserID` | string | 发送者 ID；机器人回复为自身 ID |
 | `UserName` | string | 发送者显示名；为空时回落 ID |
 | `Text` | string | 渲染后的文本，含非文本段占位符 |
+| `Images` | []string | 图片 URL 有序列表；仅 `vision_enabled=true` 时非空；不参与字符预算 |
 | `IsSelf` | bool | 是否机器人自己的回复 |
 | `EventID` | string | 事件 ID；机器人回复为发送结果消息 ID（可能为空） |
 
@@ -41,11 +42,11 @@
 
 - 只记录通过 7.1 全部准入步骤的消息，以及发送成功的机器人回复。
 - `/chat` 与 `/chat-admin` 命令由命令规则消费，不进入历史。
-- 纯非文本消息不记录；含文本的混合消息把非文本段替换为占位符后记录。
+- `vision_enabled=false` 时纯非文本消息不记录；含文本的混合消息把非文本段替换为占位符后记录。`vision_enabled=true` 时纯图片消息也记录：`Text` 为 `[图片]`，`Images` 保存非空 `KeyURL`；混合消息同时保存文本占位符与图片 URL。`KeyFile` 不写入 `Images`；URL 合法性、地址限制、大小与格式在后台下载时校验。
 - 机器人回复在 `BotAPI.Send` 成功后记录，失败不记录。
 - `Seq` 从 0 开始；每次追加后递增。新会话初始化 `consolidatedSeq=0`、`lostSeq=0`。`lastSeq` 等于会话的 `seq`，即下一条历史的序号；`consolidatedSeq >= lastSeq` 表示没有未整理消息。
-- 历史按 `history_max_messages` 与 `history_max_chars` 裁剪；字符数按 `Text` 的 rune 数计算。被裁掉且 `Seq >= consolidatedSeq` 的条目把 `lostSeq` 推进到被裁最大 `Seq + 1`，并 warn。
-- 单条历史完整保存在内存；拼进提示词时按 `context_message_max_chars=1000` 截断。
+- 历史按 `history_max_messages` 与 `history_max_chars` 裁剪；字符数按 `Text` 的 rune 数计算，`Images` 的 URL 不计入。被裁掉且 `Seq >= consolidatedSeq` 的条目把 `lostSeq` 推进到被裁最大 `Seq + 1`，并 warn。
+- 单条历史完整保存在内存；拼进提示词时按 `context_message_max_chars=1000` 截断。图片 URL 保留在原条目中，不随文本截断改写。
 
 非文本段占位符：
 
@@ -57,6 +58,8 @@
 | 卡片 | `[卡片]` |
 | 引用 | `[引用]` |
 | 其他未知段 | `[消息]` |
+
+`vision_enabled=true` 时，图片段仍生成 `[图片]` 文本占位符，同时把 `KeyURL` 写入 `Turn.Images`；两者按图片出现顺序对应。
 
 ### 8.3 上下文渲染
 
@@ -85,11 +88,14 @@
 #### 消息结构
 
 - `messages[0]`：role `system`，内容为渲染后的系统提示词 + 记忆块 + 知识库块。
-- `messages[1]`：role `user`，内容为历史块 + `[本轮消息]` + 本批每条 `显示名: 文本`。
+- `messages[1]`：role `user`。无可用图片时 `content` 为字符串：历史块 + `[本轮消息]` + 本批每条 `显示名: 文本`；`vision_enabled=true` 且有可用图片时 `content` 为多模态 parts 数组，文本块与图片块按消息顺序排列。
 - 记忆块由 [`memory.md §9.6`](memory.md#96-提示词注入) 定义，知识库块由 [`rag.md §10.7`](rag.md#107-提示词注入) 定义；无结果时整块省略。
 - 历史块头：群聊 `[群聊记录]`，私聊 `[私聊记录]`。
 - 本轮块头固定 `[本轮消息]`。
 - 历史块只包含 `Seq < batch.firstSeq` 的条目，避免与本轮重复。
+- 图片块只在 `vision_enabled=true` 时生成；从历史块与本批的 `Turn.Images` 中按从新到旧选择，最多 `vision_max_images_per_request=4` 张成功下载的图片。下载失败不占名额，继续尝试更旧图片；选中后按原消息顺序输出。
+- 图片块格式固定为 `{"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}`，紧随其 `[图片]` 占位符所在文本块；未选中或下载失败的图片只保留 `[图片]` 文本。
+- 图片不占 `context_max_chars` / `context_message_max_chars` 预算；整条历史被预算丢弃或占位符被截断时不附图片。
 
 历史选择算法：
 
@@ -121,6 +127,17 @@ messages[1]:
 李四: 用 sqlite。
 [本轮消息]
 张三: 帮我总结一下
+```
+
+视觉开启示例（`vision_enabled=true`，图片已下载为 data URL）：
+
+```text
+messages[1].content:
+[
+  {"type":"text","text":"[群聊记录]\n张三: 看这张图"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},
+  {"type":"text","text":"[本轮消息]\n张三: 这是什么？"}
+]
 ```
 
 私聊示例：
@@ -174,6 +191,7 @@ messages[1]:
 | 数据 | 进程重启 | `Stop` 时 |
 |---|---|---|
 | 短期历史 | 全部丢失 | 未整理消息丢失 |
+| 历史图片 URL | 全部丢失 | 全部丢失；长期记忆只保留已识别文本 |
 | 会话 `disabled` 覆盖 | `memory` 后端丢失；`sqlite`/`mysql` 保留 | 已提交写入保留 |
 | 长期记忆 | 取决于 Storage 后端（`vector` 表 `m:` 行） | 已提交写入保留 |
 | 知识库 | 取决于 Storage 后端（`vector` 表 `d:`/`c:` 行） | 已提交写入保留 |
@@ -188,7 +206,7 @@ messages[1]:
 - 锁顺序固定为 `sessionsMu` → `session.mu`，禁止反向获取。
 - 网络、LLM、Embedding、Storage 调用不得持锁；需要跨调用保持一致时先取快照，调用后重新加锁并校验 `epoch`。
 - timer 回调捕获创建时的 `epoch`；触发时 epoch 不匹配直接丢弃并记 `stale`。
-- 历史快照在 `session.mu` 内复制，渲染与请求构造在锁外执行。
+- 历史快照在 `session.mu` 内复制，渲染、图片下载与请求构造在锁外执行。
 - 清理任务取 `sessionsMu` 后逐会话尝试加锁；加锁失败的会话本轮跳过。
 
 ## 相关文档

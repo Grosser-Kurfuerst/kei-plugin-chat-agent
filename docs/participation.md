@@ -10,19 +10,20 @@ Handler 按以下顺序判定，任一条件命中立即返回并记录 reason�
 
 | 顺序 | 条件 | reason | 副作用 |
 |---|---|---|---|
-| 1 | 事件没有可渲染文本段（纯图片/表情/文件） | `empty_text` | 不记录、不建状态 |
+| 1 | 事件没有可渲染文本段，且没有可用图片段（纯表情/文件；或 `vision_enabled=false` 时的纯图片） | `empty_text` | 不记录、不建状态 |
 | 2 | `Sender == nil` | `no_sender` | 不记录、不建状态 |
 | 3 | `Sender.IsBot && ignore_bots` | `bot_sender` | 不记录、不建状态 |
 | 4 | `Sender.ID` 在 `self_ids` 中 | `self_sender` | 不记录、不建状态 |
 | 5 | `ev.Command != nil && !respond_to_commands` | `command` | 不记录、不建状态 |
 | 6 | 名单策略拒绝 | `not_allowed` | 不新建状态、不追加历史 |
-| 7 | 文本 rune 数 `< trigger_min_chars` | `too_short` | 不记录、不建状态 |
+| 7 | 文本 rune 数 `< trigger_min_chars`，且没有可用图片（`vision_enabled=true`） | `too_short` | 不记录、不建状态 |
 | 8 | 会话覆盖 `disabled=true` | `channel_off` | 不记录 |
 | 9 | 通过以上全部 | — | 记录历史、更新活跃时间与参与者 |
 
 补充规则：
 
-- 只有包含文本段的消息进入历史。含文本的混合消息把非文本段渲染为占位符；纯非文本消息按 `empty_text` 处理。
+- 只有包含文本段的消息进入历史；`vision_enabled=true` 时，含至少一个 `SegImage` 且 `KeyURL` 非空的消息也进入历史。含文本的混合消息把非文本段渲染为占位符；纯图片消息的 `Text` 为 `[图片]` 并保留图片 URL；纯表情/文件仍按 `empty_text` 处理。
+- 图片只接受 `SegImage` 的 `KeyURL`；`KeyFile`（本地路径或平台文件标识）不支持，视为不可用图片。`KeyURL` 的 scheme、地址限制、大小与格式在后台下载时校验；Handler 只检查非空。含图片的消息跳过 `trigger_min_chars` 文本长度检查。
 - `/chat` 与 `/chat-admin` 由独立命令规则处理，不进入消息 Handler，因此不记录历史、不调用聊天 LLM，也不受名单与会话开关影响。
 - `respond_to_commands` 只控制“其它命令消息是否作为普通聊天消息处理”。为 `false` 时一律跳过且不进历史；为 `true` 时按普通消息继续判定，可能进入历史。
 - 名单拒绝不新建会话状态；已有会话状态不追加历史，但保留原有历史与计数。
@@ -112,8 +113,8 @@ t=8.0s  触发，批次 = [A, B, C, D]
 1. 获取全局信号量；满则记 `semaphore_full`，结束。
 2. 校验会话 `epoch`；不匹配记 `stale`，结束。
 3. 快照本批消息与历史；历史只取 `seq < batch.firstSeq` 的条目。
-4. 调用 RAG 检索并渲染记忆/知识库块；失败不阻塞聊天，记 `rag_status=error`。
-5. 调用 Chat Completions；失败记 `llm_error`。
+4. 调用 RAG 检索并渲染记忆/知识库块；查询文本只含文本，不含图片；失败不阻塞聊天，记 `rag_status=error`。`vision_enabled=true` 时同时选择、下载并组装图片（见 [`conversation.md §8.3`](conversation.md#83-上下文渲染)）；单图失败只保留 `[图片]` 占位符。
+5. 调用 Chat Completions；有图片时 `user.content` 为多模态 parts，否则为字符串；失败记 `llm_error`。
 6. 清洗回复：
    - CRLF 转 LF。
    - 去掉首尾空白。
@@ -134,11 +135,18 @@ t=8.0s  触发，批次 = [A, B, C, D]
 
 `BotAPI.Send` 未返回消息 ID 时，该条不加入 `recentReplyIDs`，引用寻址与引用发送对该条不可用；回复文本去重仍然生效。
 
+图片失败语义：
+
+- 图片 URL 非法、下载失败、超时、非图片、格式不允许或超过 4 MiB 时，该图不发送给 LLM，文本中的 `[图片]` 占位符保留；记 `operation=vision reason=<bad_url|fetch_error|status|redirect|too_large|not_image|format|limit>`，不进入决策 reason 词表。
+- 单批最多附加 4 张成功下载的图片；超出的图片保留占位符，日志记 `reason=limit`。
+- `vision_enabled=true` 但 `llm_model` 不支持多模态 `content` 时，Chat 请求返回 4xx，生成记 `llm_error`，不自动回退为纯文本重试。
+- 图片下载失败不阻止文本消息生成；纯图片消息在全部图片失败时仍按 `Text=[图片]` 参与生成。
+
 ### 7.6 决策伪代码
 
 ```text
 func handleMessage(ev, kind):
-    if not hasText(ev):                 return log(empty_text)
+    if not hasContent(ev):              return log(empty_text)  // 文本或可用图片
     if ev.Sender == nil:                return log(no_sender)
     if ev.Sender.IsBot && ignore_bots:  return log(bot_sender)
     if ev.Sender.ID in self_ids:        return log(self_sender)
@@ -150,7 +158,7 @@ func handleMessage(ev, kind):
     session = sessions.getOrCreate(ev)
     if session.disabled:                return log(channel_off)
 
-    turns = session.appendHistory(ev)   // 只记录文本消息
+    turns = session.appendHistory(ev)   // 文本 + 可选图片 URL
     session.touch(ev)
 
     addressed = kind == private || isAt(ev) || isQuote(ev) || hasKeyword(text(ev))
@@ -187,8 +195,9 @@ func generate(session, batch, epoch):
     defer session.finishGeneration()
     if session.epoch != epoch: return log(stale)
     hist = session.historyBefore(batch.firstSeq)
+    images = vision.fetch(hist, batch)   // 仅 vision_enabled
     rag = rag.retrieve(text(batch))
-    req = prompt.build(hist, batch, rag, session)
+    req = prompt.build(hist, batch, rag, images, session)
     reply, err = llm.complete(req)
     if err != nil: return log(llm_error)
     reply = clean(reply)
