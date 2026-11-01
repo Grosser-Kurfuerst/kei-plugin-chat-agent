@@ -33,7 +33,7 @@
 
 ### 1.5 当前交付物
 
-当前仓库只有文档，没有 `go.mod`、源码、测试或脚手架。实现状态只在 [`roadmap.md §16.1`](roadmap.md#161-现状) 记录。
+当前仓库包含 `go.mod`、实现源码、单元测试与 mock 适配器端到端测试。实现状态只在 [`roadmap.md §16.1`](roadmap.md#161-现状) 记录。
 
 ## 2. 架构与数据流
 
@@ -399,16 +399,16 @@ KV 逻辑键（全部）：
 
 ## 5. 目录与文件职责
 
-目标实现（当前未创建）：
+实现文件：
 
 | 文件 | 职责 |
 |---|---|
 | `register.go` | `init()` 注册、`Metadata` |
 | `plugin.go` | Plugin 结构、`Setup`/`Start`/`Stop`、`wg`、信号量 |
 | `config.go` | 全部键读取、默认值、校验、错误文案 |
-| `policy.go` | 四模式名单、持久化、命令输出 |
-| `state.go` | `sessionState`、LRU、epoch、timer、覆盖懒加载 |
-| `history.go` | `Turn`、历史环、裁剪、清理任务 |
+| `policy.go` | 四模式名单、条目匹配、持久化 |
+| `state.go` | `sessionState`、LRU、epoch、批处理 timer、覆盖懒加载 |
+| `history.go` | `Turn`、历史环、裁剪、`lostSeq` |
 | `decision.go` | 过滤、寻址、随机、批处理、生成调度 |
 | `prompt.go` | 模板渲染、历史/本轮渲染、清洗、去重 |
 | `llm.go` | Chat Completions 客户端、多模态 content parts、重试、JSON 抽取 |
@@ -418,9 +418,9 @@ KV 逻辑键（全部）：
 | `memory.go` | 抽取、合并、衰减、容量、检索 |
 | `knowledge.go` | URL 抓取、HTML 提取、分块、文档管理 |
 | `rag.go` | 双库检索、预算、注入 |
-| `scheduler.go` | 两个 ticker、任务互斥、手动触发 |
-| `commands.go` | 命令解析、同步输出、异步任务回复 |
-| `admin.go` | `super_admins`、核心管理员命令、审计、持久化 |
+| `scheduler.go` | 两个 ticker、任务互斥、手动触发、缓存清理与向量重建任务 |
+| `commands.go` | 命令解析、同步输出、异步任务回复、审计 |
+| `admin.go` | `super_admins` 集合、匹配与持久化 |
 | `storage.go` | KV/表键构造、单写协程、`putRow`/`DeleteRow`、JSON/向量编码 |
 | `*_test.go` | 对应单测；`e2e_test.go` mock 适配器端到端 |
 

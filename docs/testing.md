@@ -6,7 +6,7 @@
 
 ### 15.1 质量门
 
-当前阶段没有代码，质量门从实现阶段 P1 开始适用。任何代码变更在提交前必须通过：
+质量门适用于所有代码变更。任何代码变更在提交前必须通过：
 
 ```bash
 gofmt -l .
@@ -361,12 +361,11 @@ go test -race ./...
 
 ### 15.6 文档校验
 
-本阶段可执行的检查（仓库根）：
+可执行的检查（仓库根）：
 
 ```bash
-# 交付边界
-test ! -e go.mod
-test -z "$(find . -name '*.go' -not -path './.git/*' -print -quit)"
+# 文档校验测试（章号、配置键、固定字面量）
+go test -run 'TestDocs|TestMetadataOptions' ./...
 
 # 章号 1-16 连续
 grep -h '^## [0-9]\+\.' docs/*.md | sed -E 's/^## ([0-9]+)\..*/\1/' | sort -n
@@ -401,7 +400,7 @@ grep -RIn "chat-agent: 存储表加载失败" docs
 - 所有 Markdown 文件链接目标存在；所有 `#anchor` 能在目标文件标题中找到。
 - [`configuration.md §13.1`](configuration.md#131-权威配置键表)、§13.6、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 三处键集合一致，共 82 项。
 - 每个 `docs/*.md` 有“覆盖/不覆盖”开头与“相关文档”结尾。
-- 不出现 `go.mod`、`.go`、测试或脚本文件。
+- `docs/` 与 `go.mod`、`.go` 源码、测试共存；文档校验只约束文档内容与键集合。
 
 ### 15.7 完成定义
 
