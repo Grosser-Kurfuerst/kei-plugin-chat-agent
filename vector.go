@@ -120,15 +120,17 @@ type vectorIndex struct {
 	mu sync.RWMutex
 
 	state         string
+	closed        bool
 	meta          metaJSON
 	metaFromTable bool
 	expectedModel string
 	expectedDims  int
 
-	memories        map[string]*memoryEntry
-	docs            map[string]*docEntry
-	chunks          map[string]*chunkEntry
-	deletedMemories map[string]struct{}
+	memories         map[string]*memoryEntry
+	docs             map[string]*docEntry
+	chunks           map[string]*chunkEntry
+	deletedMemories  map[string]struct{}
+	badMemoryRowKeys map[string]struct{}
 
 	reserved int
 
@@ -138,15 +140,36 @@ type vectorIndex struct {
 
 func newVectorIndex(cfg *config) *vectorIndex {
 	return &vectorIndex{
-		state:           vectorStateDisabled,
-		expectedModel:   cfg.EmbeddingModel,
-		expectedDims:    cfg.EmbeddingDimensions,
-		memories:        make(map[string]*memoryEntry),
-		docs:            make(map[string]*docEntry),
-		chunks:          make(map[string]*chunkEntry),
-		deletedMemories: make(map[string]struct{}),
-		readyCh:         make(chan struct{}),
+		state:            vectorStateDisabled,
+		expectedModel:    cfg.EmbeddingModel,
+		expectedDims:     cfg.EmbeddingDimensions,
+		memories:         make(map[string]*memoryEntry),
+		docs:             make(map[string]*docEntry),
+		chunks:           make(map[string]*chunkEntry),
+		deletedMemories:  make(map[string]struct{}),
+		badMemoryRowKeys: make(map[string]struct{}),
+		readyCh:          make(chan struct{}),
 	}
+}
+
+func (i *vectorIndex) setLoading() {
+	i.mu.Lock()
+	i.state = vectorStateLoading
+	i.mu.Unlock()
+}
+
+func (i *vectorIndex) setDisabled() {
+	i.mu.Lock()
+	i.state = vectorStateDisabled
+	i.mu.Unlock()
+}
+
+// close 使索引进入终止状态；之后 loadVector 不得再置 ready。
+func (i *vectorIndex) close() {
+	i.mu.Lock()
+	i.closed = true
+	i.mu.Unlock()
+	i.markReady()
 }
 
 func (i *vectorIndex) markReady() {
@@ -219,7 +242,31 @@ func (i *vectorIndex) visibleLocked() int {
 func (i *vectorIndex) memoryRows() int {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	return len(i.memories)
+	return len(i.memories) + len(i.badMemoryRowKeys)
+}
+
+// badMemoryKeys 返回无法解析、尚未删除的 m: 行键快照。
+func (i *vectorIndex) badMemoryKeys() []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]string, 0, len(i.badMemoryRowKeys))
+	for key := range i.badMemoryRowKeys {
+		out = append(out, key)
+	}
+	return out
+}
+
+// removeBadMemoryKey 在对应行删除成功后清理记录。
+func (i *vectorIndex) removeBadMemoryKey(key string) {
+	i.mu.Lock()
+	delete(i.badMemoryRowKeys, key)
+	i.mu.Unlock()
+}
+
+func (i *vectorIndex) addBadMemoryKey(key string) {
+	i.mu.Lock()
+	i.badMemoryRowKeys[key] = struct{}{}
+	i.mu.Unlock()
 }
 
 func (i *vectorIndex) staleMemoryRows() int {
@@ -515,7 +562,7 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 
 	docs := make(map[string]*docEntry)
 	docsValid := true
-	dRes := parseRowsConcurrently(p.ctx, dRows, vectorLoadWorkers, parseDocRow)
+	dRes := parseRowsConcurrently(p.ctx, dRows, p.vectorLoadWorkers, parseDocRow)
 	if p.ctx.Err() != nil {
 		idx.markReady()
 		return
@@ -535,13 +582,14 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		idx.markReady()
 		return
 	}
-	mRes := parseRowsConcurrently(p.ctx, mRows, vectorLoadWorkers, parseMemoryRow)
+	mRes := parseRowsConcurrently(p.ctx, mRows, p.vectorLoadWorkers, parseMemoryRow)
 	if p.ctx.Err() != nil {
 		idx.markReady()
 		return
 	}
 	for i, res := range mRes {
 		if res.err != nil {
+			idx.addBadMemoryKey(mRows[i].Key)
 			p.log.Warn("vector memory row skipped",
 				"operation", "vector", "reason", "bad_row", "key", mRows[i].Key, "error", res.err.Error())
 			continue
@@ -554,7 +602,7 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		idx.markReady()
 		return
 	}
-	cRes := parseRowsConcurrently(p.ctx, cRows, vectorLoadWorkers, parseChunkRow)
+	cRes := parseRowsConcurrently(p.ctx, cRows, p.vectorLoadWorkers, parseChunkRow)
 	if p.ctx.Err() != nil {
 		idx.markReady()
 		return
@@ -582,8 +630,10 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		expectedDims = meta.Dims
 	}
 
-	// 只有被合法 d: 行引用的分块进入索引。
+	// 只有被合法 d: 行引用的分块进入索引。引用集合独立于 doc_id 校验：
+	// 被任何文档 chunk_ids 引用的行都不能在启动回收中删除。
 	visibleChunks := make(map[string]*chunkEntry)
+	referenced := make(map[string]struct{})
 	for _, doc := range docs {
 		for _, cid := range doc.ChunkIDs {
 			chunk, ok := allChunks[cid]
@@ -592,6 +642,7 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 					"operation", "vector", "reason", "missing_chunk", "doc", doc.ID, "chunk", cid)
 				continue
 			}
+			referenced[cid] = struct{}{}
 			if chunk.DocID != doc.ID {
 				p.log.Warn("vector chunk doc mismatch",
 					"operation", "vector", "reason", "bad_row", "doc", doc.ID, "chunk", cid)
@@ -601,17 +652,17 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		}
 	}
 
-	referenced := make(map[string]struct{}, len(visibleChunks))
-	for id := range visibleChunks {
-		referenced[id] = struct{}{}
-	}
-
 	if p.stopping.Load() || p.ctx.Err() != nil {
 		idx.markReady()
 		return
 	}
 
 	idx.mu.Lock()
+	if idx.closed {
+		idx.mu.Unlock()
+		idx.markReady()
+		return
+	}
 	idx.meta = meta
 	idx.metaFromTable = metaValid
 	idx.expectedDims = expectedDims
@@ -625,6 +676,12 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		idx.chunks[id] = c
 	}
 	idx.mu.Unlock()
+
+	if p.stopping.Load() || p.ctx.Err() != nil {
+		idx.markReady()
+		return
+	}
+	p.enforceLoadedCapacity()
 
 	if p.stopping.Load() || p.ctx.Err() != nil {
 		idx.markReady()
@@ -661,6 +718,11 @@ func (p *Plugin) loadVector(rows []bot.TableRow) {
 		return
 	}
 	idx.mu.Lock()
+	if idx.closed {
+		idx.mu.Unlock()
+		idx.markReady()
+		return
+	}
 	idx.state = vectorStateReady
 	idx.mu.Unlock()
 	idx.markReady()
@@ -675,7 +737,7 @@ func parseMetaRow(raw []byte) (metaJSON, bool) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return metaJSON{}, false
 	}
-	if m.Version != 1 || m.Dims < 0 {
+	if m.Version != 1 || m.Dims < 0 || strings.TrimSpace(m.Model) == "" {
 		return metaJSON{}, false
 	}
 	return m, true
@@ -933,15 +995,100 @@ func (i *vectorIndex) docSnapshot() []*docEntry {
 	return out
 }
 
+func copyMemoryEntry(m *memoryEntry) *memoryEntry {
+	cp := *m
+	cp.Vector = append([]float32(nil), m.Vector...)
+	cp.Sources = append([]string(nil), m.Sources...)
+	return &cp
+}
+
 // upsertMemory 在内存索引中插入或替换记忆。
 func (i *vectorIndex) upsertMemory(m *memoryEntry) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	cp := *m
-	cp.Vector = append([]float32(nil), m.Vector...)
-	cp.Sources = append([]string(nil), m.Sources...)
-	i.memories[m.ID] = &cp
+	i.memories[m.ID] = copyMemoryEntry(m)
 	delete(i.deletedMemories, m.ID)
+}
+
+const memoryInsertGuard = ^uint64(0)
+
+// applyMemoryWrite 在行写入成功后用版本校验切换内存快照。
+// guard 为 memoryInsertGuard 表示期望不存在；否则必须匹配当前 Version。
+func (i *vectorIndex) applyMemoryWrite(rec *memoryEntry, guard uint64) (current *memoryEntry, applied, deleted bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if _, ok := i.deletedMemories[rec.ID]; ok {
+		return nil, false, true
+	}
+	cur, exists := i.memories[rec.ID]
+	if guard == memoryInsertGuard {
+		if exists {
+			return copyMemoryEntry(cur), false, false
+		}
+	} else if !exists || cur.Version != guard {
+		if exists {
+			return copyMemoryEntry(cur), false, false
+		}
+		return nil, false, false
+	}
+	i.memories[rec.ID] = copyMemoryEntry(rec)
+	delete(i.deletedMemories, rec.ID)
+	return nil, true, false
+}
+
+// claimMemory 在物理删除前移除记录并设置 tombstone，阻止并发写复活。
+func (i *vectorIndex) claimMemory(id string) (*memoryEntry, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	m, ok := i.memories[id]
+	if !ok {
+		return nil, false
+	}
+	delete(i.memories, id)
+	i.deletedMemories[id] = struct{}{}
+	return copyMemoryEntry(m), true
+}
+
+// claimMemoryVersion 只在版本未变化时 claim，避免删除刚被检索强化的记录。
+func (i *vectorIndex) claimMemoryVersion(id string, version uint64) (*memoryEntry, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	m, ok := i.memories[id]
+	if !ok || m.Version != version {
+		return nil, false
+	}
+	delete(i.memories, id)
+	i.deletedMemories[id] = struct{}{}
+	return copyMemoryEntry(m), true
+}
+
+// restoreMemory 在删除失败时恢复 claim 前的快照；若已有更新的记录则不动。
+func (i *vectorIndex) restoreMemory(m *memoryEntry) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if _, ok := i.memories[m.ID]; ok {
+		return
+	}
+	i.memories[m.ID] = copyMemoryEntry(m)
+	delete(i.deletedMemories, m.ID)
+}
+
+// applyReinforcement 只为版本未变化的记录清除 Dirty。
+func (i *vectorIndex) applyReinforcement(m *memoryEntry) (current *memoryEntry, applied, deleted bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if _, ok := i.deletedMemories[m.ID]; ok {
+		return nil, false, true
+	}
+	cur, ok := i.memories[m.ID]
+	if !ok {
+		return nil, false, false
+	}
+	if cur.Version != m.Version {
+		return copyMemoryEntry(cur), false, false
+	}
+	cur.Dirty = false
+	return nil, true, false
 }
 
 // isMemoryDeleted 返回记录是否已被删除（用于阻止延迟写入复活）。
@@ -980,14 +1127,6 @@ func (i *vectorIndex) applyReindexChunk(id string, vec []float32, model string) 
 	c.Model = model
 	c.Stale = false
 	return true
-}
-
-// removeMemory 删除内存记忆。
-func (i *vectorIndex) removeMemory(id string) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	delete(i.memories, id)
-	i.deletedMemories[id] = struct{}{}
 }
 
 // statusState 返回当前索引状态。

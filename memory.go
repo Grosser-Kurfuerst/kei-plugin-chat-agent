@@ -440,6 +440,15 @@ func (p *Plugin) storeMemories(ctx context.Context, s *sessionState, mems []extr
 			ids = append(ids, id)
 			continue
 		}
+		id = memoryIDFor(scope, scopeKey, m.Text)
+		if existing, ok := p.idx.memoryByID(id); ok {
+			if err := p.mergeMemoryRecord(ctx, existing, m, vec, now, sources); err != nil {
+				return added, merged, ids, err
+			}
+			merged++
+			ids = append(ids, id)
+			continue
+		}
 		// 新插入
 		_, cerr := p.ensureMemoryCapacity(ctx, 1)
 		if cerr != nil {
@@ -449,7 +458,7 @@ func (p *Plugin) storeMemories(ctx context.Context, s *sessionState, mems []extr
 			return added, merged, ids, kerr("storage_error", cerr)
 		}
 		rec := &memoryEntry{
-			ID:         memoryIDFor(scope, scopeKey, m.Text),
+			ID:         id,
 			Scope:      scope,
 			ScopeKey:   scopeKey,
 			Kind:       m.Kind,
@@ -463,11 +472,24 @@ func (p *Plugin) storeMemories(ctx context.Context, s *sessionState, mems []extr
 			UpdatedAt:  now,
 			LastUsedAt: now,
 		}
-		if err := p.putRowWait(ctx, memoryRowKey(rec.ID), marshalJSON(memoryRecordOf(rec))); err != nil {
+		key := memoryRowKey(rec.ID)
+		if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(rec))); err != nil {
 			p.idx.releaseSlots(1)
 			return added, merged, ids, kerr("storage_error", err)
 		}
-		p.idx.upsertMemory(rec)
+		current, applied, deleted := p.idx.applyMemoryWrite(rec, memoryInsertGuard)
+		if !applied {
+			p.idx.releaseSlots(1)
+			if deleted {
+				_ = p.deleteRowWait(ctx, key)
+			} else if current != nil {
+				if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(current))); err != nil {
+					p.log.Warn("memory insert rollback failed",
+						"operation", "consolidate", "reason", "storage_error", "memory", rec.ID, "error", err.Error())
+				}
+			}
+			return added, merged, ids, kerr("storage_error", errors.New("memory insert conflict"))
+		}
 		p.idx.releaseSlots(1)
 		added++
 		ids = append(ids, rec.ID)
@@ -488,6 +510,14 @@ func (p *Plugin) mergeTarget(ctx context.Context, scope, scopeKey string, m extr
 	if !ok {
 		return "", false, nil
 	}
+	if err := p.mergeMemoryRecord(ctx, old, m, vec, now, sources); err != nil {
+		return "", false, err
+	}
+	return old.ID, true, nil
+}
+
+// mergeMemoryRecord 用新候选更新已有记忆；行写入后用版本 CAS 切换内存快照。
+func (p *Plugin) mergeMemoryRecord(ctx context.Context, old *memoryEntry, m extractedMemory, vec []float32, now time.Time, sources []string) error {
 	rec := *old
 	rec.Text = m.Text
 	rec.Kind = m.Kind
@@ -500,11 +530,25 @@ func (p *Plugin) mergeTarget(ctx context.Context, scope, scopeKey string, m extr
 	rec.LastUsedAt = now
 	rec.UseCount++
 	rec.Version = old.Version + 1
-	if err := p.putRowWait(ctx, memoryRowKey(rec.ID), marshalJSON(memoryRecordOf(&rec))); err != nil {
-		return "", false, kerr("storage_error", err)
+	key := memoryRowKey(rec.ID)
+	if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(&rec))); err != nil {
+		return kerr("storage_error", err)
 	}
-	p.idx.upsertMemory(&rec)
-	return rec.ID, true, nil
+	current, applied, deleted := p.idx.applyMemoryWrite(&rec, old.Version)
+	if applied {
+		return nil
+	}
+	if deleted {
+		_ = p.deleteRowWait(ctx, key)
+		return kerr("storage_error", errors.New("memory deleted concurrently"))
+	}
+	if current != nil {
+		if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(current))); err != nil {
+			p.log.Warn("memory merge rollback failed",
+				"operation", "consolidate", "reason", "storage_error", "memory", rec.ID, "error", err.Error())
+		}
+	}
+	return kerr("storage_error", errors.New("memory version conflict"))
 }
 
 func mergeSources(old, add []string) []string {
@@ -522,7 +566,13 @@ func mergeSources(old, add []string) []string {
 func (p *Plugin) ensureMemoryCapacity(ctx context.Context, need int) (evicted int, err error) {
 	for {
 		p.idx.mu.Lock()
-		if p.idx.visibleLocked()+need <= p.cfg.VectorMaxRecords {
+		visible := p.idx.visibleLocked()
+		nonMemory := visible - len(p.idx.memories)
+		if nonMemory+need > p.cfg.VectorMaxRecords {
+			p.idx.mu.Unlock()
+			return evicted, errVectorFull
+		}
+		if visible+need <= p.cfg.VectorMaxRecords {
 			p.idx.reserved += need
 			p.idx.mu.Unlock()
 			return evicted, nil
@@ -544,6 +594,47 @@ func (p *Plugin) ensureMemoryCapacity(ctx context.Context, need int) (evicted in
 			return evicted, derr
 		}
 		evicted++
+	}
+}
+
+// enforceLoadedCapacity 在启动加载后把可见记录压回上限。只淘汰记忆；
+// 知识块占用超过上限时记录 Error，等待管理员删除文档或提高上限。
+func (p *Plugin) enforceLoadedCapacity() {
+	for {
+		p.idx.mu.Lock()
+		visible := p.idx.visibleLocked()
+		if visible <= p.cfg.VectorMaxRecords {
+			p.idx.mu.Unlock()
+			return
+		}
+		if visible-len(p.idx.memories) > p.cfg.VectorMaxRecords {
+			p.idx.mu.Unlock()
+			p.log.Error("vector capacity exceeded",
+				"operation", "vector", "reason", "capacity_exceeded",
+				"visible", visible, "limit", p.cfg.VectorMaxRecords)
+			return
+		}
+		victim := p.pickMemoryVictimLocked()
+		if victim == nil {
+			p.idx.mu.Unlock()
+			p.log.Error("vector capacity exceeded",
+				"operation", "vector", "reason", "capacity_exceeded",
+				"visible", visible, "limit", p.cfg.VectorMaxRecords)
+			return
+		}
+		delete(p.idx.memories, victim.ID)
+		p.idx.deletedMemories[victim.ID] = struct{}{}
+		p.idx.mu.Unlock()
+
+		if err := p.deleteRowWait(p.ctx, memoryRowKey(victim.ID)); err != nil {
+			p.idx.mu.Lock()
+			p.idx.memories[victim.ID] = victim
+			delete(p.idx.deletedMemories, victim.ID)
+			p.idx.mu.Unlock()
+			p.log.Warn("vector capacity eviction failed",
+				"operation", "vector", "reason", "storage_error", "memory", victim.ID, "error", err.Error())
+			return
+		}
 	}
 }
 
@@ -602,12 +693,16 @@ func (p *Plugin) decayMemories(ctx context.Context) (expired, evicted int) {
 		if !remove {
 			continue
 		}
+		entry, claimed := p.idx.claimMemoryVersion(m.ID, m.Version)
+		if !claimed {
+			continue
+		}
 		if err := p.deleteRowWait(ctx, memoryRowKey(m.ID)); err != nil {
+			p.idx.restoreMemory(entry)
 			p.log.Warn("memory delete failed",
 				"operation", "consolidate", "reason", "storage_error", "memory", m.ID, "error", err.Error())
 			continue
 		}
-		p.idx.removeMemory(m.ID)
 		expired++
 	}
 	return expired, evicted
@@ -622,20 +717,26 @@ func (p *Plugin) flushReinforcements(ctx context.Context) {
 		if !m.Dirty || p.idx.isMemoryDeleted(m.ID) {
 			continue
 		}
-		if err := p.putRowWait(ctx, memoryRowKey(m.ID), marshalJSON(memoryRecordOf(m))); err != nil {
+		key := memoryRowKey(m.ID)
+		if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(m))); err != nil {
 			p.log.Warn("memory reinforcement write failed",
 				"operation", "consolidate", "reason", "storage_error", "memory", m.ID, "error", err.Error())
 			continue
 		}
-		p.idx.mu.Lock()
-		if cur, ok := p.idx.memories[m.ID]; ok && cur.Version == m.Version {
-			cur.Dirty = false
+		current, applied, deleted := p.idx.applyReinforcement(m)
+		if applied {
+			continue
 		}
-		_, deleted := p.idx.deletedMemories[m.ID]
-		p.idx.mu.Unlock()
 		if deleted {
-			if err := p.deleteRowWait(ctx, memoryRowKey(m.ID)); err != nil {
+			if err := p.deleteRowWait(ctx, key); err != nil {
 				p.log.Warn("memory delete after reinforcement failed",
+					"operation", "consolidate", "reason", "storage_error", "memory", m.ID, "error", err.Error())
+			}
+			continue
+		}
+		if current != nil {
+			if err := p.putRowWait(ctx, key, marshalJSON(memoryRecordOf(current))); err != nil {
+				p.log.Warn("memory reinforcement rollback failed",
 					"operation", "consolidate", "reason", "storage_error", "memory", m.ID, "error", err.Error())
 			}
 		}

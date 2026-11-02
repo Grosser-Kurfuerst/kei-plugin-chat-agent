@@ -18,6 +18,7 @@ import (
 type Plugin struct {
 	lifecycleMu sync.Mutex
 	started     bool
+	closed      bool
 
 	cfg    *config
 	log    *slog.Logger
@@ -35,6 +36,10 @@ type Plugin struct {
 	waitStarted bool
 	wg          sync.WaitGroup
 	sem         chan struct{}
+
+	vectorLoadWorkers  int
+	vectorReadyTimeout time.Duration
+	tableLoadTimeout   time.Duration
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*sessionState
@@ -94,6 +99,9 @@ func (p *Plugin) Setup(ctx context.Context, reg bot.Registrar) error {
 	}
 	p.sessions = make(map[string]*sessionState)
 	p.sem = make(chan struct{}, cfg.LimitsMaxConcurrent)
+	p.vectorLoadWorkers = defaultVectorLoadWorkers
+	p.vectorReadyTimeout = defaultVectorReadyTimeout
+	p.tableLoadTimeout = defaultTableLoadTimeout
 	p.policy = newPolicyStore(cfg)
 	p.admins = newAdminStore(cfg)
 	p.stopping.Store(false)
@@ -129,6 +137,9 @@ func (p *Plugin) Start(ctx context.Context) error {
 	if p.cfg == nil {
 		return errors.New("chat-agent: 插件未完成 Setup")
 	}
+	if p.closed {
+		return errors.New("chat-agent: 插件已关闭")
+	}
 	if p.started {
 		return nil
 	}
@@ -159,7 +170,7 @@ func (p *Plugin) Start(ctx context.Context) error {
 			p.shutdownEarly()
 			return fmt.Errorf("chat-agent: 存储表初始化失败: %w", err)
 		}
-		loadCtx, cancel := context.WithTimeout(p.ctx, tableLoadTimeout)
+		loadCtx, cancel := context.WithTimeout(p.ctx, p.tableLoadTimeout)
 		rows, err = p.tables.ListRows(loadCtx, tableName)
 		cancel()
 		if err != nil {
@@ -169,7 +180,7 @@ func (p *Plugin) Start(ctx context.Context) error {
 	}
 
 	p.writer = newWriteQueue(p.ctx, p.kv, p.tables, p.log)
-	p.writer.start()
+	p.writer.start(&p.wg)
 	if featuresOn {
 		p.embedWorker = newEmbedQueue(p.ctx, p.embedder, p.log)
 		p.wg.Add(1)
@@ -181,14 +192,14 @@ func (p *Plugin) Start(ctx context.Context) error {
 
 	p.idx = newVectorIndex(p.cfg)
 	if featuresOn {
-		p.idx.state = vectorStateLoading
+		p.idx.setLoading()
 		p.wg.Add(1)
 		go func() {
 			defer p.wg.Done()
 			p.loadVector(rows)
 		}()
 	} else {
-		p.idx.state = vectorStateDisabled
+		p.idx.setDisabled()
 		p.idx.markReady()
 		p.jobs.start()
 	}
@@ -213,19 +224,34 @@ func (p *Plugin) Stop(ctx context.Context) error {
 }
 
 func (p *Plugin) doStop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(shutdownWaitTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+
 	p.lifecycleMu.Lock()
 	if !p.started {
-		p.lifecycleMu.Unlock()
+		p.closed = true
 		p.stopping.Store(true)
-		if p.cancel != nil {
-			p.cancel()
+		cancel := p.cancel
+		p.lifecycleMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 		return nil
 	}
 	p.started = false
+	p.closed = true
+	cancel := p.cancel
 	p.lifecycleMu.Unlock()
 
 	p.stopping.Store(true)
+	p.bgMu.Lock()
+	p.waitStarted = true
+	p.bgMu.Unlock()
 
 	if p.writer != nil {
 		p.writer.stopAccepting()
@@ -233,21 +259,24 @@ func (p *Plugin) doStop(ctx context.Context) error {
 	if p.jobs != nil {
 		p.jobs.stop()
 	}
+
+	drainCtx, drainCancel := context.WithDeadline(ctx, deadline)
+	drained := true
 	if p.writer != nil {
-		p.writer.waitDrained()
+		drained = p.writer.waitDrained(drainCtx)
 	}
-	if p.cancel != nil {
-		p.cancel()
+	drainCancel()
+	// 排空失败时同样取消插件 ctx，让仍在执行的写操作尽快退出。
+	if cancel != nil {
+		cancel()
 	}
 	p.invalidateAllSessions()
 	if p.idx != nil {
-		p.idx.markReady()
+		p.idx.close()
 	}
 
-	p.bgMu.Lock()
-	p.waitStarted = true
-	p.bgMu.Unlock()
-
+	waitCtx, waitCancel := context.WithDeadline(ctx, deadline)
+	defer waitCancel()
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -255,8 +284,13 @@ func (p *Plugin) doStop(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		if !drained {
+			p.log.Error("shutdown incomplete",
+				"operation", "message", "reason", "shutdown_incomplete")
+			return errors.New("chat-agent: 关闭不完整")
+		}
 		return nil
-	case <-time.After(shutdownWaitTimeout):
+	case <-waitCtx.Done():
 		p.log.Error("shutdown incomplete",
 			"operation", "message", "reason", "shutdown_incomplete")
 		return errors.New("chat-agent: 关闭不完整")
@@ -266,7 +300,7 @@ func (p *Plugin) doStop(ctx context.Context) error {
 // runBackground 在 wg 中执行后台函数并隔离 panic；Wait 开始后拒绝新任务。
 func (p *Plugin) runBackground(fn func()) bool {
 	p.bgMu.Lock()
-	if p.waitStarted {
+	if p.waitStarted || p.stopping.Load() {
 		p.bgMu.Unlock()
 		return false
 	}

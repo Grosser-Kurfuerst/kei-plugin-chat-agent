@@ -3,7 +3,6 @@ package chatagent
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 
 	"github.com/RandomLemon/kei/pkg/bot"
@@ -56,6 +55,9 @@ func (s *adminStore) load(ctx context.Context, p *Plugin) {
 			return
 		}
 	}
+	for i := range v.SuperAdmins {
+		v.SuperAdmins[i] = normalizePlatformEntry(v.SuperAdmins[i])
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ordered = dedupeStrings(v.SuperAdmins)
@@ -88,20 +90,21 @@ func (s *adminStore) list() []string {
 }
 
 // add 添加管理员；重复添加视为成功。
-func (s *adminStore) add(id string) {
-	id = strings.TrimSpace(id)
+func (s *adminStore) add(id string) bool {
+	id = normalizePlatformEntry(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.set[id]; ok {
-		return
+		return false
 	}
 	s.set[id] = struct{}{}
 	s.ordered = append(s.ordered, id)
+	return true
 }
 
 // del 删除管理员；删除唯一管理员返回 false。
 func (s *adminStore) del(id string) (removed bool, last bool) {
-	id = strings.TrimSpace(id)
+	id = normalizePlatformEntry(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.set[id]; !ok {

@@ -18,7 +18,7 @@ go test -race ./...
 
 执行环境：
 
-- flake devShell 提供 Go 1.25 与 C 工具链。
+- flake devShell 提供 Go 与 C 工具链；Go 具体版本以 `flake.lock` 固定的 nixpkgs 为准。
 - `GOTOOLCHAIN=local`，禁止自动下载工具链。
 - SQLite 后端测试使用 `CGO_ENABLED=1`；其它包不要求 CGO。
 - `gofmt -l .` 必须无输出。
@@ -77,6 +77,7 @@ go test -race ./...
 | 引用寻址 | 命中最近 128 条机器人 ID 环；不在环内不寻址 |
 | 关键词 | ASCII 大小写不敏感；中文子串；空列表不寻址 |
 | 私聊 | 恒寻址，不受 @/引用/关键词影响 |
+| 引用段 | `reply_quote` 使用 `Message.ID`；事件 ID 与消息 ID 不同也不串用 |
 | 概率 0/1 | 0 永不回复；1 在其它条件满足时必回复 |
 | 冷却 | `mention_min_interval` 内返回 `cooldown`，之后恢复 |
 | 随机开关 | `random_enabled=false` 返回 `not_addressed` |
@@ -189,6 +190,7 @@ go test -race ./...
 | reindex 写 meta | 全部成功后 `meta` 为当前 `model`/`dims`；部分失败保留旧 `meta` |
 | 容量 visible | 只计 `m:` 行与被引用 `c:` 行；`d:`/`meta`/未引用块不计数 |
 | 容量 projected | 更新文档时 `visible - 旧块数 + 新块数` 超限返回 `vector_full`，不写新块 |
+| 加载容量 | 启动后 `visible > vector_max_records` 时淘汰记忆至上限；知识块超限只记录 `capacity_exceeded` |
 | 表物理临时超限 | 更新期间行数可超过上限，回收后回落 |
 | 两功能关闭 | `state=disabled`，不建表、不加载 |
 | 加载等待 | 2s 未就绪时 RAG 跳过，`rag_status=loading` |
@@ -210,11 +212,12 @@ go test -race ./...
 | 新插入 | ID 确定性，sources 最多 8，计数从 0 开始 |
 | 衰减 | 半衰期后 effective 减半；低于阈值删除 |
 | TTL | `last_used_at` 超过 `memory_ttl` 删除 |
-| 容量 | 满时先淘汰 stale 记忆，再淘汰最低 effective；无可淘汰时 `vector_full` |
+| 容量 | 满时先淘汰 stale 记忆，再淘汰最低 effective；知识块占满时不先淘汰记忆，直接 `vector_full` |
 | scope | 群聊检索频道 + 发送者；私聊只检索发送者 |
 | 强化 | 命中后 use_count/last_used_at/importance 在内存更新 |
-| 强化落库 | 下一轮整理写入批量更新；失败保留内存值 |
-| 记忆命令 | status/search/add/del/reset 的输出与副作用 |
+| 强化落库 | 下一轮整理写入批量更新；版本冲突时恢复较新行；失败保留内存值 |
+| 记忆命令 | status/add/del/reset 的输出与副作用；reset 删除损坏的未加载行 |
+| 记忆搜索 | 先回 `memory search: 已开始`，后台完成发送结果；`memory_top_k=0` 不发起 embedding |
 | 未启用 | 所有记忆命令输出未启用文案 |
 | 图片抽取 | vision 开启时附加 `image_url`；识别文本写入普通 `m:` 行 |
 | 图片分批 | 每批最多 4 张；全部批次成功后水位推进 |
@@ -230,8 +233,9 @@ go test -race ./...
 |---|---|
 | URL scheme | 非 http(s) 返回 `url_rejected` |
 | userinfo | 带 userinfo 返回 `url_rejected` |
-| 私网地址 | 回环、10/8、127/8、169.254/16 等全部拒绝 |
+| 私网地址 | 回环、10/8、127/8、169.254/16 等全部拒绝；主机名解析到私网也拒绝 |
 | 重定向 | 每跳重新校验；超过 3 跳失败 |
+| 拨号固定 | 受限 transport 在拨号时校验解析 IP 并禁用代理 |
 | Content-Type | 缺失/空/不允许返回 `unsupported_type`；带参数可匹配 |
 | 大小限制 | 超过 `knowledge_max_bytes` 返回 `too_large` |
 | HTML 提取 | comment/script/style/noscript 去除，实体解码 |
@@ -280,6 +284,7 @@ go test -race ./...
 | URL scheme | 非 http(s)、缺 host、带 userinfo 的图片 URL 被跳过 |
 | 私网地址 | 回环、10/8、127/8、169.254/16、CGNAT、保留段等全部拒绝 |
 | 重定向 | 每跳重新校验；超过 `vision_max_redirects=3` 失败并记 `reason=redirect` |
+| 自定义 dialer | 仍拒绝回环/私网地址，不因宿主自定义 `DialContext` 绕过 |
 | 状态码 | 非 200 跳过并记 `reason=status` |
 | Content-Type | 非 `image/*` 时用 `DetectContentType` 兜底；仍非图片则跳过 |
 | 大小限制 | 超过 4 MiB 跳过并记 `reason=too_large` |
@@ -303,9 +308,9 @@ go test -race ./...
 | `knowledgeFetcher` | 接口 | URL 校验、重定向、Content-Type、大小 |
 | `Storage` | 接口 | 内存 fake、写失败、读超时 |
 | `Tables` | 接口 | 表 fake：`CreateTable`/`ListRows` 错误、`bot.ErrRowExists`、`bot.ErrTableNotFound`、行读写失败 |
-| `vectorLoadWorkers` | int | 默认 4，测试设为 1 |
-| `vectorReadyTimeout` | duration | 默认 2s，测试缩短 |
-| `tableLoadTimeout` | duration | 默认 30s，测试缩短 |
+| `Plugin.vectorLoadWorkers` | int | 默认 4，测试设为 1；实例字段，非包级可变状态 |
+| `Plugin.vectorReadyTimeout` | duration | 默认 2s，测试缩短 |
+| `Plugin.tableLoadTimeout` | duration | 默认 30s，测试缩短 |
 
 约束：
 
@@ -316,32 +321,31 @@ go test -race ./...
 
 ### 15.4 mock 适配器端到端
 
-宿主测试程序：
+仓库内实现：`e2e_test.go` 是 `package chatagent`，直接调用 `kei.Run` 装配真实宿主、插件与 `adapters/mock`；不包含单独的 `main` 包，也不包含 SQLite 持久化场景。存储使用并发安全的 `memStore`（同时实现 `Storage` 与 `TableStorage`）。Chat/Embedding 由本地 `httptest.Server` 桩提供。
 
-- main 包空导入 `github.com/RandomLemon/kei-plugin-chat-agent`。
-- 空导入 `github.com/RandomLemon/kei/adapters/mock`。
-- 使用 SQLite 时空导入 `github.com/RandomLemon/kei/pkg/kei/sql`，配置 `storage.type: sqlite`。
-- 启动本地 Chat 与 Embedding 桩服务：Chat 返回固定文本；Embedding 返回固定维度向量。
-- 配置 `group_policy=whitelist`、`group_list=[g9]`、`private_policy=open`、`self_ids=[bot]`、`super_admins=[platform:admin]`、`memory_enabled=true`、`rag_enabled=true`、`vision_enabled=true`。
-- 预置一条记忆与一条知识：管理员执行 `/chat memory add` 与 `/chat knowledge add-text`，等待完成。
+测试程序要点：
 
-场景：
+- 注册测试用 mock 适配器，通过 `kei.Run` 启动宿主；等待插件索引 `ready`。
+- 配置 `group_policy=whitelist`、`group_list=[g9]`、`private_policy=open`、`self_ids=[bot]`、`super_admins=[e2e:admin]`、`memory_enabled=true`、`rag_enabled=true`、`vision_enabled=true`。
+- 图片 e2e 显式把 `visionClient` 替换为本地 `httptest` client（生产受限 client 会拒绝回环地址）。
+- 预置记忆与知识通过管理员命令，等待异步完成消息。
 
-1. 群聊名单：`Adapter.Inject` 注入 g1 的群消息，断言无 `Send`、无历史；注入 g9 的 @ 消息，断言回复。
-2. 私聊：注入私聊消息，断言 `Target.Kind=MessagePrivate`、`Target.UserID` 为发送者、`Target.ChannelID` 为空；群聊回复断言 `Kind=MessageGroup`、`ChannelID` 正确、`UserID` 为空。
-3. 寻址与 RAG：注入含 `SegAt` 的群消息，断言回复；检查桩服务捕获的请求体包含 `<long_term_memory>` 与 `<knowledge_base>` 块。
-4. 整理与持久化：注入未整理消息，执行 `/chat jobs run consolidate`；对宿主根 `TableStorage` 断言 `ListTables` 含 `plugin:chat-agent:vector`，`ListRows("plugin:chat-agent:vector")` 出现新的 `m:` 行与 `meta` 行；停止并重启宿主，执行 `/chat memory status`，断言记录仍在。
-5. 知识库：执行 `/chat knowledge add-text`，断言 `vector` 表出现 `d:` 与 `c:` 行且 `chunk_ids` 引用它们；注入查询消息，断言知识块命中；执行 `/chat knowledge list`，断言文档与分块计数。
-6. 清理：配置短 `history_ttl` 与长 `history_unconsolidated_ttl`；注入历史后等待空闲，执行 `/chat jobs run cleanup`，断言已整理空闲会话消失、未整理会话仍受硬 TTL 保护。
-7. 管理员：super_admin 执行 `/chat policy` 并重启，断言覆盖保留；核心管理员执行 `/chat-admin status` 成功；非管理员执行 `/chat` 得到 `chat-agent: 无权执行该命令`。
-8. 图片识别与记忆：通过 `visionClient` 注入固定 PNG；注入含 `SegImage` 的群消息，断言 Chat 桩收到 `content` parts 且含 `data:image/png;base64,...`；执行 `/chat jobs run consolidate`，断言 `vector` 表新 `m:` 行的 `text` 含固定识别描述；重启后执行 `/chat memory search`，断言该记忆可检索。
+已覆盖场景：
+
+1. 群聊名单与私聊目标：g1 无发送；g9 @ 回复；私聊 `Target.Kind=MessagePrivate`、`UserID` 正确、`ChannelID` 为空。
+2. RAG 注入：检查 Chat 桩请求包含 `<long_term_memory>` 与 `<knowledge_base>`。
+3. 整理与重启持久化：执行 `/chat jobs run consolidate`，断言 `vector` 表出现 `m:`/`meta`；重启宿主后 `/chat memory status` 记录仍在。
+4. 知识库：`/chat knowledge add-text` 后断言 `d:` 与 `c:` 行及 `knowledge list` 计数。
+5. 清理保护：`history_ttl` 到期但未整理会话仍受硬 TTL 保护。
+6. 管理员：super_admin 覆盖持久化、核心管理员、非管理员拒绝。
+7. 图片识别与记忆：Chat 桩收到 data URL parts，整理后写入识别文本，重启后可异步检索。
 
 断言要求：
 
 - 每条断言检查实际发送消息、KV 键、`vector` 表行或桩请求体，不检查“没有报错”。
-- 端到端测试使用固定时间与固定向量，保证可重复。
-- SQLite 文件使用临时目录，测试结束删除。
+- Chat/Embedding 响应与向量固定；时间敏感场景尽量轮询状态，现有少量 `time.Sleep` 仅用于负向/清理场景。
 - 不依赖外部网络与真实 API key。
+- SQLite/MySQL 后端不在当前 e2e 覆盖范围内，由库测试替换 `memStore` 验证核心语义。
 
 ### 15.5 竞态与优雅关闭
 
@@ -351,13 +355,14 @@ go test -race ./...
   - Embedding 中调用 `Stop`：请求 ctx 取消，任务返回。
   - 知识库抓取中调用 `Stop`：抓取 ctx 取消，不写半成品。
   - 图片下载中调用 `Stop`：下载 ctx 取消，不发送、不写记忆，`wg` 归零。
-  - 写队列有积压时 `Stop`：队列排空后取消，已提交写入保留。
-  - 索引异步构建中调用 `Stop`：构建 ctx 取消，`wg` 归零，`state` 不进入 `ready`，不发送消息。
-  - `Stop` 后调用 `Send` 的路径必须被拒绝，测试断言发送计数不增加。
-  - 连续两次 `Stop`：第二次立即返回，不 panic。
-- 不引入 `goleak`；用显式 `sync.WaitGroup`、原子计数与 `Stop` 返回时限验证无泄漏。
-- timer 回调在 `Stop` 后不得触发发送；epoch 检查覆盖。
-- 并发测试至少覆盖：同群不同用户并发 Handler、生成与清理并发、整理与知识库并发写队列。
+  - 写队列有积压时 `Stop`：在剩余 `shutdown_wait_timeout` 内排空后取消，已提交写入保留；排空超时返回 `关闭不完整`。
+  - 索引异步构建中调用 `Stop`：构建 ctx 取消，`wg` 归零，索引关闭后不进入 `ready`，不发送消息。
+  - `Stop` 后调用 `Send` 或 Handler/timer 新任务的路径必须被拒绝，测试断言发送计数不增加。
+  - 连续两次 `Stop`：第二次立即返回，不 panic；先 `Stop` 再 `Start` 返回 `chat-agent: 插件已关闭`。
+- 不引入 `goleak`；用显式 `sync.WaitGroup`、原子计数与 `Stop` 返回时限验证无泄漏；写协程纳入 `wg`。
+- timer 回调在 `Stop` 后不得触发发送；`epoch` 与 timer 布防序号共同校验，旧回调不得清除新 timer。
+- 记忆相关任务（consolidate/memory/reindex）互斥；行写入后用版本 CAS 切换内存快照，删除先写 tombstone；不在锁内做 Storage 调用。
+- 并发测试至少覆盖：同群不同用户并发 Handler、生成与清理并发、整理与知识库并发写队列、timer 重布防竞态。
 
 ### 15.6 文档校验
 
@@ -396,10 +401,11 @@ grep -RIn "chat-agent: 存储表加载失败" docs
 
 补充检查：
 
-- `docs/README.md` 索引表与磁盘文件一一对应。
-- 所有 Markdown 文件链接目标存在；所有 `#anchor` 能在目标文件标题中找到。
-- [`configuration.md §13.1`](configuration.md#131-权威配置键表)、§13.6、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 三处键集合一致，共 82 项。
-- 每个 `docs/*.md` 有“覆盖/不覆盖”开头与“相关文档”结尾。
+- `docs/README.md` 列出每个 `docs/*.md` 文件名；`docs_test.go` 检查文件名出现与章号 1-16 唯一。
+- `docs/*.md` 中的 `*.md` 链接目标存在，`#anchor` 能在目标文件标题中找到；根 `README.md` 与 `AGENTS.md` 链接由人工检查。
+- [`configuration.md §13.1`](configuration.md#131-权威配置键表)、§13.6、[`architecture.md §6`](architecture.md#6-与-kei-核心的契约对应) 三处键集合一致，共 82 项；`docs_test.go` 逐项比较。
+- 每个 `docs/*.md` 含“覆盖：”与“相关文档”段落。
+- `configuration.md` 默认值、表名/行键/JSON 形状由人工/契约测试覆盖，不在 `docs_test.go` 全量解析。
 - `docs/` 与 `go.mod`、`.go` 源码、测试共存；文档校验只约束文档内容与键集合。
 
 ### 15.7 完成定义

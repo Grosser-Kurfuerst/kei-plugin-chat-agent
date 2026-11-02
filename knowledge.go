@@ -82,7 +82,7 @@ func newKnowledgeFetcher(cfg *config, client *http.Client) knowledgeFetcher {
 		allowed[t] = struct{}{}
 	}
 	return &httpKnowledgeFetcher{
-		client:       client,
+		client:       newRestrictedClient(client, cfg.KnowledgeURLAllowPrivate),
 		allowedTypes: allowed,
 		maxBytes:     cfg.KnowledgeMaxBytes,
 		allowPrivate: cfg.KnowledgeURLAllowPrivate,
@@ -164,7 +164,7 @@ func fetchContextError(ctx context.Context, err error) error {
 		return kerr("timeout", err)
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
-		return kerr("timeout", err)
+		return kerr("internal_error", err)
 	}
 	return kerr("fetch_error", err)
 }

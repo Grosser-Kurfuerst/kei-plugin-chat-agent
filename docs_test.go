@@ -57,6 +57,32 @@ func TestDocsConfigKeySets(t *testing.T) {
 	if strings.Join(archKeys, "\n") != strings.Join(got, "\n") {
 		t.Fatalf("architecture Options (%d) != Metadata.Options (%d)", len(archKeys), len(got))
 	}
+
+	start = strings.Index(cfgDoc, "以下清单是 `Metadata.Options` 的镜像")
+	if start < 0 {
+		t.Fatal("configuration mirror list missing")
+	}
+	block = cfgDoc[start:]
+	open := strings.Index(block, "```text\n")
+	if open < 0 {
+		t.Fatal("configuration mirror block missing")
+	}
+	block = block[open+len("```text\n"):]
+	closeAt := strings.Index(block, "\n```")
+	if closeAt < 0 {
+		t.Fatal("configuration mirror block unterminated")
+	}
+	var mirrorKeys []string
+	for _, line := range strings.Split(block[:closeAt], "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			mirrorKeys = append(mirrorKeys, line)
+		}
+	}
+	sort.Strings(mirrorKeys)
+	if strings.Join(mirrorKeys, "\n") != strings.Join(got, "\n") {
+		t.Fatalf("configuration mirror (%d) != Metadata.Options (%d)", len(mirrorKeys), len(got))
+	}
 }
 
 func TestDocsIndexAndChapters(t *testing.T) {

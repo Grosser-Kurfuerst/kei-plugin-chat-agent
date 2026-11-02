@@ -78,7 +78,7 @@
 水位推进：
 
 - 只有本批全部合法记录行写入成功后，才推进 `consolidatedSeq` 到本批最后一条的 `Seq + 1`。
-- 任一行写失败保留水位，下一轮重试。确定性 ID 与合并逻辑保证重试幂等。
+- 任一行写失败保留水位，下一轮重试。确定性 ID 与合并逻辑保证行覆盖幂等；重试的合并仍会增加 `use_count`。
 - 会话历史被裁剪导致 `lostSeq > consolidatedSeq` 时，从 `lostSeq` 开始处理可用消息；处理成功后水位至少推进到 `lostSeq`，并 warn 丢失区间。若该区间没有可用消息，直接把水位推进到 `lostSeq` 并 warn。
 - 写入 `vector_full` 时不推进水位；容量处理见 [`vector-index.md §11.7`](vector-index.md#117-容量与淘汰)。
 
@@ -98,7 +98,7 @@
   - `created_at` 保留。
 - 新插入：`created_at=updated_at=last_used_at=now`，`use_count=0`，`sources` 为来源事件 ID（最多 8 条）。
 - ID 由 `scope`、`scope_key`、`normalized_text` 决定，因此同一文本重复抽取会命中同一 ID；合并仍会先做向量相似度判断。
-- 一次整理的多条记录各写成独立的 `m:` 行，经同一写队列串行提交。任一行失败时已写行保留、水位不推进；下次重试用相同确定性 ID 覆盖或合并，因此幂等。
+- 一次整理的多条记录各写成独立的 `m:` 行，经同一写队列串行提交。任一行失败时已写行保留、水位不推进；下次重试用相同确定性 ID 覆盖或合并，因此行内容幂等（合并的 `use_count` 会再次增加）。
 
 ### 9.4 定时整理
 
@@ -107,7 +107,7 @@
 - 每 `memory_consolidate_interval` 跑一次；值为 0 关闭定时整理。
 - `jobs_run_on_start=true` 时启动后立即跑一次。
 - 每轮 task ctx 派生自插件级 ctx，带 `memory_consolidate_timeout=5m` 总超时。
-- 同一时间只允许一个整理任务；手动 `/chat jobs run consolidate` 与定时任务共用运行标志，忙碌时返回 `job_busy`。
+- 同一时间只允许一个整理任务；手动 `/chat jobs run consolidate` 与定时任务共用运行标志，忙碌时返回 `job_busy`。记忆命令与 `/chat vector reindex` 也共享记忆变更互斥，避免并发读改写。
 
 每轮步骤：
 
@@ -199,19 +199,19 @@ operation=consolidate duration_ms=18420 sessions_done=3 sessions_failed=0 memori
 | 命令 | 同步/异步 | 行为 |
 |---|---|---|
 | `/chat memory status` | 同步 | 输出记录数、stale 数、待整理会话数、最近整理时间 |
-| `/chat memory search <query>` | 同步 | 用当前会话 scope 与 `memory_top_k` 检索 |
+| `/chat memory search <query>` | 异步 | 先回 `memory search: 已开始`，后台用当前会话 scope 与 `memory_top_k` 检索 |
 | `/chat memory add <text>` | 异步 | 写入当前会话 scope，`kind=fact`、`importance=0.8` |
 | `/chat memory del <id>` | 异步 | 全局删除指定记忆 |
 | `/chat memory reset confirm` | 异步 | 全局删除全部记忆，不删知识库 |
 
 细节：
 
-- `status` 输出 `memory: records=<n> stale=<n> pending_sessions=<n> last=<RFC3339|never>`。`records` 计 `vector` 表全部 `m:` 行，`stale` 是其中子集；`pending_sessions` 是 `consolidatedSeq < lastSeq` 的会话数；`last` 是最近一次整理完成时间。
-- `search` 需要一次查询 embedding，命令处理器同步等待 `embedding_timeout`；群聊使用频道 + 发送者 scope，私聊使用发送者 scope。
-- `search` 有结果输出 `memory search: <n> 条结果`，随后每行 `<id> <score:.3f> <kind> <text>`；无结果输出 `memory search: 无结果`。
+- `status` 输出 `memory: records=<n> stale=<n> pending_sessions=<n> last=<RFC3339|never>`。`records` 计 `vector` 表全部 `m:` 行（含无法解析、等待 reset 清理的行）；`stale` 是可解析且模型/维度不匹配的已加载行；`pending_sessions` 是 `consolidatedSeq < lastSeq` 的会话数；`last` 是最近一次整理完成时间。
+- `search` 是后台任务：命令立即输出 `memory search: 已开始`，后台在 `embedding_timeout` 内完成查询 embedding；群聊使用频道 + 发送者 scope，私聊使用发送者 scope。`memory_top_k=0` 时不再发起 embedding，直接输出 `memory search: 无结果`。
+- `search` 完成后发送 `memory search: <n> 条结果`，随后每行 `<id> <score:.3f> <kind> <text>`；无结果发送 `memory search: 无结果`；失败发送 `memory search: 失败 <reason>`。
 - `add` 先输出 `memory: 已接受`，完成后输出 `memory: 完成 <id>`，失败输出 `memory: 失败 <reason>`；走与整理相同的合并逻辑。
 - `del` 先查内存索引（由 `m:` 行加载）；不存在直接输出 `chat-agent: 未找到: <id>`，不输出已接受；存在则输出 `memory: 已接受`，后台用 `DeleteRow` 删除该 `m:` 行。
-- `reset` 必须带 `confirm`；输出 `memory: 已接受`，完成输出 `memory: 完成 reset`，失败输出 `memory: 失败 <reason>`。
+- `reset` 必须带 `confirm`；输出 `memory: 已接受`，完成输出 `memory: 完成 reset`，失败输出 `memory: 失败 <reason>`。reset 删除全部 `m:` 行，包括启动时因 JSON/base64/维度损坏而被跳过、未进入内存索引的行。
 - `memory_enabled=false` 时所有记忆子命令输出 `chat-agent: 记忆功能未启用`。
 - `vector.state=loading` 时 `status`、`search`、`add`、`del`、`reset` 输出 `chat-agent: 向量索引未就绪`；未启用文案优先。
 - 任务互斥时输出 `chat-agent: 忙碌: memory`。

@@ -363,15 +363,19 @@ func TestMemoryCommands(t *testing.T) {
 		t.Fatalf("status=%q", status)
 	}
 	search := runCommand(t, env.p, commandEvent("chat", "memory search hello world", "admin", "g"))
-	if !strings.HasPrefix(search, "memory search: 1 条结果") || !strings.Contains(search, id) {
+	if search != "memory search: 已开始" {
 		t.Fatalf("search=%q", search)
+	}
+	sn = env.bot.waitSends(2, time.Second)
+	if len(sn) < 2 || !strings.HasPrefix(messageText(sn[1].msg), "memory search: 1 条结果") || !strings.Contains(messageText(sn[1].msg), id) {
+		t.Fatalf("search completion=%v", sn)
 	}
 	out = runCommand(t, env.p, commandEvent("chat", "memory del "+id, "admin", "g"))
 	if out != "memory: 已接受" {
 		t.Fatalf("del out=%q", out)
 	}
-	sn = env.bot.waitSends(2, time.Second)
-	if len(sn) < 2 || messageText(sn[1].msg) != "memory: 完成 "+id {
+	sn = env.bot.waitSends(3, time.Second)
+	if len(sn) < 3 || messageText(sn[2].msg) != "memory: 完成 "+id {
 		t.Fatalf("del completion=%v", sn)
 	}
 	status = runCommand(t, env.p, commandEvent("chat", "memory status", "admin", "g"))

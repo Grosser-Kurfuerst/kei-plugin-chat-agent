@@ -35,11 +35,10 @@ const (
 	rfc3339Nano = time.RFC3339Nano
 )
 
-// 测试可缩短的注入点；默认值与 docs/configuration.md §13.1 一致。
-var (
-	vectorLoadWorkers  = 4
-	vectorReadyTimeout = 2 * time.Second
-	tableLoadTimeout   = 30 * time.Second
+const (
+	defaultVectorLoadWorkers  = 4
+	defaultVectorReadyTimeout = 2 * time.Second
+	defaultTableLoadTimeout   = 30 * time.Second
 )
 
 // sessionStorageKey 返回会话覆盖的 KV 逻辑键。
@@ -112,9 +111,15 @@ func normalizeVector(v []float32) ([]float32, error) {
 
 // dot 计算点积；输入已归一化时等于余弦相似度。
 func dot(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return math.Inf(-1)
+	}
 	var sum float64
 	for i := range a {
 		sum += float64(a[i]) * float64(b[i])
+	}
+	if math.IsNaN(sum) {
+		return math.Inf(-1)
 	}
 	return sum
 }
@@ -169,8 +174,12 @@ func newWriteQueue(ctx context.Context, storage bot.Storage, tables bot.TableSto
 	return w
 }
 
-func (w *writeQueue) start() {
-	go w.loop()
+func (w *writeQueue) start(wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.loop()
+	}()
 }
 
 func (w *writeQueue) loop() {
@@ -271,9 +280,14 @@ func (w *writeQueue) stopAccepting() {
 	w.cond.Broadcast()
 }
 
-// waitDrained 等待队列排空与写协程退出。
-func (w *writeQueue) waitDrained() {
-	<-w.done
+// waitDrained 等待队列排空与写协程退出；返回 false 表示 ctx 先到期。
+func (w *writeQueue) waitDrained(ctx context.Context) bool {
+	select {
+	case <-w.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // submit 入队；关闭后返回 false。

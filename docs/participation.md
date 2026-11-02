@@ -16,7 +16,7 @@ Handler 按以下顺序判定，任一条件命中立即返回并记录 reason�
 | 4 | `Sender.ID` 在 `self_ids` 中 | `self_sender` | 不记录、不建状态 |
 | 5 | `ev.Command != nil && !respond_to_commands` | `command` | 不记录、不建状态 |
 | 6 | 名单策略拒绝 | `not_allowed` | 不新建状态、不追加历史 |
-| 7 | 文本 rune 数 `< trigger_min_chars`，且没有可用图片（`vision_enabled=true`） | `too_short` | 不记录、不建状态 |
+| 7 | 去首尾空白后的文本 rune 数 `< trigger_min_chars`，且没有可用图片（`vision_enabled=true`） | `too_short` | 不记录、不建状态 |
 | 8 | 会话覆盖 `disabled=true` | `channel_off` | 不记录 |
 | 9 | 通过以上全部 | — | 记录历史、更新活跃时间与参与者 |
 
@@ -68,6 +68,7 @@ Handler 按以下顺序判定，任一条件命中立即返回并记录 reason�
 
 - 非寻址消息到达时，若当前没有待处理批次、pending 或在途生成，评估一次随机路径；通过则创建批次并把该消息纳入。窗口内后续命中消息直接加入同一批次，不再掷概率。
 - 会话已有待处理批次时，新的命中消息加入该批次；非寻址消息只记录历史，不重新评估随机路径。
+- 寻址消息加入随机批次时，该批 `pendingRandom` 置为 false，整批按寻址轮次处理（不识别 skip token）。
 - 已有在途生成时，非寻址消息只记录历史，不评估随机路径，也不进入 pending。
 - `random_quiet_hours` 为空串或 `start == end` 表示禁用；支持跨零点区间，例如 `23:00-07:00`。区间边界包含开始、不包含结束。
 - `random_probability=0` 永不触发；`=1` 在其它条件全部满足时必定触发。
@@ -153,7 +154,7 @@ func handleMessage(ev, kind):
     if ev.Command != nil && !respond_to_commands:
                                         return log(command)
     if not policy.allows(kind, ev):     return log(not_allowed)
-    if runeLen(text(ev)) < trigger_min_chars:
+    if runeLen(trimSpace(text(ev))) < trigger_min_chars && not usable_image(ev):
                                         return log(too_short)
     session = sessions.getOrCreate(ev)
     if session.disabled:                return log(channel_off)
@@ -222,6 +223,8 @@ min_participants, semaphore_full, llm_error, skipped_by_llm, empty_reply,
 duplicate_reply, send_error, stale
 ```
 
+裁剪历史时另有一条 `operation=message reason=history_trimmed` 的 warn 日志；它不进入上面的决策 reason 词表。
+
 `rag_status` 单独记录，不进入 reason 词表：
 
 | 值 | 含义 |
@@ -261,14 +264,14 @@ operation=generate reason=skipped_by_llm rag_status=ok session=3f9a1c kind=group
 
 - `platform:id` 形式精确匹配平台名与 ID，例如 `telegram:-100123`。
 - 不含冒号的条目匹配任意平台的原始 ID，例如 `-100123`。
-- 配置校验要求条目非空；`platform:id` 两侧都不能为空。运行时 `list add` 同样校验。
+- 配置校验要求条目非空；`group_list`/`private_list` 的 `platform:id` 两侧都不能为空。加载时平台条目会 trim 两侧空白；运行时 `list add` 同样校验并规范化。
 - 列表去重并保持首次出现顺序。
 
 加载与覆盖：
 
 - 未覆盖时使用配置值：`group_policy`、`private_policy`、`group_list`、`private_list`；默认值由 [`configuration.md §13.1`](configuration.md#131-权威配置键表) 定义。
 - `policy` Storage 键存在时，按 `group_mode`、`group_list`、`private_mode`、`private_list` 逐字段覆盖配置；`[]` 覆盖为空名单。
-- JSON 损坏或模式非法时整个覆盖回落到配置并 warn；单个字段非法同样回落该字段。
+- JSON 整体损坏时整个覆盖回落到配置并 warn；单个字段（模式或列表）非法时只回落该字段，其余合法字段继续生效。
 - `/chat policy reset` 删除 `policy` 键，恢复配置值。
 
 运行时修改：

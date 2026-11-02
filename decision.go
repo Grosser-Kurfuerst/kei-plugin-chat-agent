@@ -21,6 +21,9 @@ func (p *Plugin) handlePrivateMessage(ctx context.Context, ev *bot.Event, r bot.
 
 // handleMessage 执行 7.1 的固定判定顺序；Handler 只做内存操作。
 func (p *Plugin) handleMessage(ctx context.Context, ev *bot.Event, kind string) error {
+	if p.stopping.Load() {
+		return nil
+	}
 	start := time.Now()
 	text, images, hasText, hasImage := renderInboundMessage(ev, p.cfg.VisionEnabled)
 	if !hasText && !hasImage {
@@ -76,7 +79,7 @@ func (p *Plugin) handleMessage(ctx context.Context, ev *bot.Event, kind string) 
 		return nil
 	}
 
-	turn := p.appendUserTurn(s, text, images, ev.Sender.ID, ev.Sender.Name, ev.ID, ev.Time)
+	turn := p.appendUserTurnWithMeta(s, text, images, ev.Sender.ID, ev.Sender.Name, ev.ID, inboundMessageID(ev), ev.Sender.IsBot, ev.Time)
 	now := p.now()
 	addressed := kind == "private" || p.isAddressed(s, ev, text, selfIDs)
 
@@ -162,6 +165,9 @@ func roll(randFloat func() float64, probability float64) bool {
 
 // startBatchLocked 把消息加入 pending 并重置批处理 timer。
 func (p *Plugin) startBatchLocked(s *sessionState, turn Turn, random bool, now time.Time) {
+	if p.stopping.Load() {
+		return
+	}
 	if len(s.pending) == 0 {
 		s.firstAt = now
 	}
@@ -187,16 +193,21 @@ func (p *Plugin) startBatchLocked(s *sessionState, turn Turn, random bool, now t
 	if s.timer != nil {
 		s.timer.Stop()
 	}
+	s.timerSeq++
+	seq := s.timerSeq
 	epoch := s.epoch
 	s.timer = p.afterFunc(delay, func() {
-		p.onBatchTimer(s, epoch)
+		p.onBatchTimer(s, epoch, seq)
 	})
 }
 
 // onBatchTimer 取走 pending 并调度生成。
-func (p *Plugin) onBatchTimer(s *sessionState, epoch uint64) {
+func (p *Plugin) onBatchTimer(s *sessionState, epoch, seq uint64) {
+	if p.stopping.Load() {
+		return
+	}
 	s.mu.Lock()
-	if s.epoch != epoch {
+	if s.epoch != epoch || s.timerSeq != seq {
 		s.mu.Unlock()
 		p.log.Warn("batch timer stale", "operation", "generate", "reason", "stale",
 			"session", sessionLogPrefix(s.key))
@@ -213,33 +224,29 @@ func (p *Plugin) onBatchTimer(s *sessionState, epoch uint64) {
 		s.mu.Unlock()
 		return
 	}
+	// 在同一把锁内获取信号量并置 inflight，避免释放锁后另一个 timer
+	// 在同一会话上启动第二次生成。
+	select {
+	case p.sem <- struct{}{}:
+	default:
+		s.pending = nil
+		s.pendingRandom = false
+		s.firstAt = time.Time{}
+		s.nextBatchAt = time.Time{}
+		s.mu.Unlock()
+		p.log.Warn("generation semaphore full", "operation", "generate", "reason", "semaphore_full",
+			"session", sessionLogPrefix(s.key))
+		return
+	}
 	batch := s.pending
 	random := s.pendingRandom
 	s.pending = nil
 	s.pendingRandom = false
 	s.firstAt = time.Time{}
 	s.nextBatchAt = time.Time{}
-	s.mu.Unlock()
-	sort.Slice(batch, func(i, j int) bool { return batch[i].Seq < batch[j].Seq })
-
-	select {
-	case p.sem <- struct{}{}:
-	default:
-		p.log.Warn("generation semaphore full", "operation", "generate", "reason", "semaphore_full",
-			"session", sessionLogPrefix(s.key))
-		return
-	}
-
-	s.mu.Lock()
-	if s.epoch != epoch {
-		s.mu.Unlock()
-		<-p.sem
-		p.log.Warn("batch stale after acquire", "operation", "generate", "reason", "stale",
-			"session", sessionLogPrefix(s.key))
-		return
-	}
 	s.inflight = true
 	s.mu.Unlock()
+	sort.Slice(batch, func(i, j int) bool { return batch[i].Seq < batch[j].Seq })
 
 	if !p.runBackground(func() { p.generate(s, batch, random, epoch) }) {
 		<-p.sem
@@ -333,8 +340,8 @@ func (p *Plugin) generate(s *sessionState, batch []Turn, random bool, epoch uint
 		segments = append(segments, bot.Segment{Type: bot.SegAt, Data: map[string]any{bot.KeyUserID: last.UserID}})
 	}
 	segments = append(segments, bot.Segment{Type: bot.SegText, Data: map[string]any{bot.KeyText: text}})
-	if p.cfg.ReplyQuote && last.EventID != "" {
-		segments = append(segments, bot.Segment{Type: bot.SegReply, Data: map[string]any{bot.KeyMessageID: last.EventID}})
+	if p.cfg.ReplyQuote && last.MessageID != "" {
+		segments = append(segments, bot.Segment{Type: bot.SegReply, Data: map[string]any{bot.KeyMessageID: last.MessageID}})
 	}
 	msg := &bot.Message{Kind: s.kindMessageKind(), Segments: segments}
 	s.mu.Lock()
@@ -367,7 +374,7 @@ func (p *Plugin) finishGeneration(s *sessionState, epoch uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.inflight = false
-	if s.epoch != epoch {
+	if s.epoch != epoch || p.stopping.Load() {
 		return
 	}
 	if len(s.pending) == 0 || s.timer != nil {
@@ -375,8 +382,10 @@ func (p *Plugin) finishGeneration(s *sessionState, epoch uint64) {
 	}
 	s.firstAt = p.now()
 	s.nextBatchAt = s.firstAt.Add(100 * time.Millisecond)
+	s.timerSeq++
+	seq := s.timerSeq
 	s.timer = p.afterFunc(100*time.Millisecond, func() {
-		p.onBatchTimer(s, epoch)
+		p.onBatchTimer(s, epoch, seq)
 	})
 }
 
@@ -400,7 +409,10 @@ func (p *Plugin) isAddressed(s *sessionState, ev *bot.Event, text string, selfID
 				continue
 			}
 			if len(selfIDs) == 0 {
-				return true
+				if len(p.cfg.SelfIDs) == 0 {
+					return true
+				}
+				continue
 			}
 			if _, ok := selfIDs[uid]; ok {
 				return true
@@ -423,7 +435,17 @@ func keywordsMatch(text, keyword string) bool {
 	if keyword == "" {
 		return false
 	}
-	return strings.Contains(strings.ToLower(text), strings.ToLower(keyword))
+	return strings.Contains(asciiLower(text), asciiLower(keyword))
+}
+
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // normalizedSelfIDs 把配置条目的 platform:id 规范化为当前平台的裸 ID。
@@ -454,6 +476,14 @@ func (p *Plugin) selfUserID(platform string) string {
 		return entry
 	}
 	return ""
+}
+
+// inboundMessageID 返回入站平台消息 ID；事件 ID 与消息 ID 是不同契约。
+func inboundMessageID(ev *bot.Event) string {
+	if ev == nil || ev.Message == nil {
+		return ""
+	}
+	return ev.Message.ID
 }
 
 // renderInboundMessage 把消息段渲染为历史文本与图片 URL 列表。

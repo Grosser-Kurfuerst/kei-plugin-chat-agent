@@ -48,7 +48,7 @@
 
 规则：
 
-- `/chat` 单独执行、未知子命令或参数不足时输出用法。
+- `/chat` 单独执行或未知子命令时输出用法；已知子命令缺少必需参数时输出参数错误。
 - `/chat-admin` 使用同一子命令集，唯一区别是授权来源。
 - 以下省略等价：
   - `/chat admins` = `/chat admins list`
@@ -56,7 +56,7 @@
   - `/chat knowledge` = `/chat knowledge list`
   - `/chat jobs` = `/chat jobs status`
   - `/chat vector` = `/chat vector status`
-  - `/chat policy` 显示两种模式与两个列表
+  - `/chat policy` 显示两种模式；名单用 `/chat list`
   - `/chat list` 显示两个列表
 - `policy` 设置必须写成 `/chat policy <group|private> <mode>`；`/chat policy <mode>` 是参数错误。
 - `list add|del` 必须写成 `/chat list <group|private> add|del <id>`；缺少类型是参数错误。
@@ -72,7 +72,7 @@
 | 无权执行 | `chat-agent: 无权执行该命令` |
 | 用法 | `chat-agent: 用法: /chat <status\|on\|off\|reset\|policy\|list\|admins\|memory\|knowledge\|jobs\|vector\|help>` |
 | 参数错误 | `chat-agent: 参数错误: <detail>` |
-| 忙碌 | `chat-agent: 忙碌: <consolidate\|cleanup\|knowledge\|memory\|vector>` |
+| 忙碌 | memory/vector：`chat-agent: 忙碌: <memory\|vector>`；knowledge：`knowledge: 失败 busy`；jobs：`jobs: 失败 <name>: job_busy` |
 | 功能未启用 | `chat-agent: 记忆功能未启用` / `chat-agent: 知识库功能未启用` |
 | 向量未就绪 | `chat-agent: 向量索引未就绪` |
 | 未找到 | `chat-agent: 未找到: <id>` |
@@ -83,7 +83,7 @@
 | 管理员 | `admins: <id,id\|(empty)>`；`admins: 已添加 <id>`；`admins: 已删除 <id>`；`admins: 已重置` |
 | 会话开关 | `chat-agent: 本会话已启用` / `本会话已停用` / `本会话已重置` |
 | 记忆状态 | `memory: records=<n> stale=<n> pending_sessions=<n> last=<RFC3339\|never>` |
-| 记忆搜索 | `memory search: <n> 条结果`，随后每行 `<id> <score:.3f> <kind> <text>`；无结果 `memory search: 无结果` |
+| 记忆搜索 | 开始 `memory search: 已开始`；完成 `memory search: <n> 条结果`，随后每行 `<id> <score:.3f> <kind> <text>`；无结果 `memory search: 无结果`；失败 `memory search: 失败 <reason>` |
 | 记忆写入 | `memory: 已接受`；完成 `memory: 完成 <id>`；失败 `memory: 失败 <reason>` |
 | 知识库列表 | `knowledge: docs=<n> chunks=<n>`；每行 `<docID> <title> chunks=<n> updated=<RFC3339>`；空 `knowledge: (empty)` |
 | 知识库任务 | `knowledge: 已开始 <url\|text\|del\|refresh>`；完成 `knowledge: 完成 doc=<id> chunks=<n> result=<added\|updated\|unchanged\|deleted>`；失败 `knowledge: 失败 <reason>` |
@@ -135,8 +135,8 @@
 
 #### 14.3.5 memory
 
-- `/chat memory status` 见 [`memory.md §9.7`](memory.md#97-管理命令)；`stale` 是 `vector` 表中 stale 记忆行数，`records` 计全部 `m:` 行。
-- `/chat memory search <query>` 同步检索，输出固定结果格式；`memory_enabled=false` 时输出未启用。
+- `/chat memory status` 见 [`memory.md §9.7`](memory.md#97-管理命令)；`records` 计全部 `m:` 行（含无法解析的行），`stale` 是可解析且模型/维度不匹配的行。
+- `/chat memory search <query>` 异步检索：先输出 `memory search: 已开始`，完成后发送结果；失败输出 `memory search: 失败 <reason>`；`memory_enabled=false` 时输出未启用。查询 embedding 超出 `embedding_timeout` 或任务忙碌时分别输出 `timeout`、`chat-agent: 忙碌: memory`。
 - `/chat memory add <text>` 输出 `memory: 已接受`，后台完成后输出 `memory: 完成 <id>` 或 `memory: 失败 <reason>`。
 - `/chat memory del <id>` 未找到时输出 `chat-agent: 未找到: <id>`；找到时先输出 `memory: 已接受`，完成后输出 `memory: 完成 <id>`。
 - `/chat memory reset confirm` 输出 `memory: 已接受`，完成后输出 `memory: 完成 reset`；缺少 `confirm` 是参数错误。
@@ -200,7 +200,7 @@ KV 逻辑键：
 
 - 启动时同步加载 `policy` 与 `admins`；`session` 按首条消息懒加载；`vector` 表行在 `Start` 用 `ListRows` 异步加载。
 - 所有 KV 与表行写入经同一单写协程；命令在内存更新后提交写入并立即输出成功，不等待持久化。
-- 写失败只记 warn 与计数；重启后以最后一次成功写入为准。
+- 写失败只记 warn；重启后以最后一次成功写入为准。
 - `reset` 是删除键，不是写入空值；删除后恢复配置默认。
 - `policy` JSON 损坏或字段非法时回落配置；`admins` JSON 损坏时回落配置。
 - `session` 只持久化 `disabled`，不持久化历史。
@@ -211,6 +211,7 @@ KV 逻辑键：
 
 | 任务 | 触发输出 | 完成输出 | 失败输出 |
 |---|---|---|---|
+| 记忆搜索 | `memory search: 已开始` | `memory search: <n> 条结果` / `无结果` | `memory search: 失败 <reason>` |
 | 记忆添加 | `memory: 已接受` | `memory: 完成 <id>` | `memory: 失败 <reason>` |
 | 记忆删除 | `memory: 已接受` | `memory: 完成 <id>` | `memory: 失败 <reason>` |
 | 记忆重置 | `memory: 已接受` | `memory: 完成 reset` | `memory: 失败 <reason>` |
@@ -230,7 +231,7 @@ invalid_text, not_found, internal_error
 
 规则：
 
-- 同类任务串行：记忆整理、知识库任务、向量重建各自有独立运行标志；同类任务忙碌时立即失败，不排队。不同类型任务可并行，但共享单写协程与 Embedding 队列。
+- 任务串行：记忆整理、记忆命令与向量重建共享记忆变更互斥；知识库任务独立；同类/相关任务忙碌时立即失败，不排队。清理可与这些任务并行，但共享单写协程与 Embedding 队列。
 - 完成/失败消息发回触发命令的会话；发送失败只记日志，不重试。
 - 触发时已完成授权；后台任务不再检查权限。
 - 任务失败不修改已提交的数据；记忆水位与已提交的 `m:`/`d:` 行保持旧状态。

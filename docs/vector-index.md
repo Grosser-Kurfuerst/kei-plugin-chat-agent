@@ -23,18 +23,13 @@
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `ID` | string | 32 位小写 hex |
-| `Collection` | string | `memory` 或 `knowledge` |
 | `Text` | string | 原始文本，用于重建与 reindex；图片记忆为识别描述 |
 | `Vector` | `[]float32` | 已 L2 归一化 |
 | `Dims` | int | 维度 |
 | `Model` | string | 生成向量的模型 |
-| `Scope` | string | 记忆为 `channel`/`user`；知识块为空 |
-| `ScopeKey` | string | 记忆的 scope key；知识块为空 |
-| `DocID` | string | 知识块的文档 ID；记忆为空 |
-| `ChunkIndex` | int | 知识块序号；记忆为 -1 |
 | `Stale` | bool | 模型或维度与当前期望不匹配 |
 
-`VectorRecord` 不单独落盘；它由 `vector` 表的 `m:<id32>` 与 `c:<id32>` 行构造。行形状见 [`architecture.md §4.4`](architecture.md#44-storage-模式)。
+实现使用两个内存类型：`memoryEntry` 额外含 `Scope`/`ScopeKey`/`Kind`/`Importance`/`Sources` 等记忆字段；`chunkEntry` 额外含 `DocID`/`Index`/`CreatedAt`。没有独立的 `VectorRecord` 或 `Collection` 字段；集合由 `m:` 与 `c:` 行键区分。行形状见 [`architecture.md §4.4`](architecture.md#44-storage-模式)。
 
 行键与来源：
 
@@ -92,7 +87,7 @@ vector: state=<ready|loading|disabled> model=<model> dims=<n> memory=<n> knowled
 ```
 
 - `disabled`：`memory_enabled=false && rag_enabled=false`，不建表、不加载。
-- `loading`：启动加载尚未完成，计数是已解析的部分。
+- `loading`：启动加载尚未完成；计数在行解析完成并发布快照后才出现，发布前为 0。
 - `ready`：加载完成，包括空表。
 - `model`/`dims` 报告 `meta` 的期望值；`meta` 缺失或非法时报告配置值，维度为 0。
 - `memory`/`knowledge` 只计非 stale、可检索的行；`stale` 计全部 stale 的记忆行与分块行。
@@ -123,7 +118,7 @@ vector: state=<ready|loading|disabled> model=<model> dims=<n> memory=<n> knowled
 - 删除：先 `DeleteRow` `d:` 行（提交移除），再删旧块；删块失败只 warn。
 - 顺序与失败语义见 [`rag.md §10.5`](rag.md#105-索引与更新) 与 [`architecture.md §4.7`](architecture.md#47-表一致性与孤儿回收)。
 
-写队列与 `Stop` 的顺序见 [`architecture.md §3.4`](architecture.md#34-关闭顺序) 与 §4.6。写入失败记 warn 与计数，不 panic。
+写队列与 `Stop` 的顺序见 [`architecture.md §3.4`](architecture.md#34-关闭顺序) 与 §4.6。写入失败记 warn，不 panic。
 
 ### 11.5 查询算法
 
@@ -172,6 +167,7 @@ visible <= vector_max_records
 - 计入 stale 记忆行与被引用的 stale 分块行。
 - `d:`、`meta` 与未被引用的 `c:` 行不计数。
 - 更新期间表物理行数可临时超过上限（先写新块、后删旧块），回收后回落。
+- 启动加载完成后若 `visible > vector_max_records`，按同一 effective 规则淘汰记忆直到回到上限；若知识块本身已超过上限，不删除知识块，记录 `capacity_exceeded` Error。
 
 插入记忆：
 
@@ -179,11 +175,11 @@ visible <= vector_max_records
 2. 否则优先淘汰 stale 记忆，再按 effective 从低到高淘汰当前记忆。
 3. effective 使用 [`memory.md §9.4`](memory.md#94-定时整理) 的衰减公式；相同 effective 按 ID 升序。
 4. 淘汰走 `DeleteRow`；删除失败返回 `storage_error`，本次不插入、不推进水位。
-5. 若没有可淘汰的记忆（名额全部被知识块占用，包括 stale 知识块），本次写入失败 `vector_full`。
+5. 若非记忆记录（知识块与预留名额）已占满上限，立即失败 `vector_full`，不先淘汰记忆；没有可淘汰记忆时同样失败。
 
 插入知识块：
 
-- `projected = visible - len(old_doc_chunks) + new_chunk_count`；超过上限时不写新块，返回 `vector_full`。
+- `projected = visible - 当前可见旧文档分块数 + 新分块数`；`visible` 含进行中预留；超过上限时不写新块，返回 `vector_full`。
 - 不淘汰任何知识块或记忆。
 - 单文档分块写入前先估算；不足时整批失败，不写半成品。
 
@@ -200,6 +196,7 @@ reindex 不增加记录数；删除文档释放其全部分块名额。
 | 行键前缀未知 | 跳过并 warn，不删除 | 手动清理未知行 |
 | 任一 `d:` 行非法 | 跳过回收并 warn，保留未引用分块 | 修复或删除该文档行后重启 |
 | 未引用 `c:` 行 | 不加载、不可见、不计数 | 启动回收；失败则下次启动重试 |
+| `c:` 行被文档引用但 `doc_id` 不匹配 | 不进入检索并 warn，但不因 `doc_id` 错误被回收删除 | 修复行内 `doc_id` 或 doc 的 `chunk_ids` |
 | `meta` 缺失或非法 | 按配置与已有行推导，尽力重写 | 自动；失败只 warn |
 | 模型/维度变更 | 标记 stale，排除检索 | `/chat vector reindex` |
 | 容量满 | 记忆可淘汰；知识块拒绝 | 删除文档或提高上限后重启 |
@@ -216,9 +213,9 @@ reindex 不增加记录数；删除文档释放其全部分块名额。
 | `embedder` | 固定维度向量、错误、超时 |
 | `Storage` | 内存 fake、故障注入 |
 | `Tables` | 表 fake：`CreateTable`/`ListRows` 错误、`bot.ErrRowExists`、`bot.ErrTableNotFound` |
-| `vectorLoadWorkers` | 默认 4，测试可设为 1 |
-| `vectorReadyTimeout` | 默认 2s，测试可缩短 |
-| `tableLoadTimeout` | 默认 30s，测试可缩短 |
+| `Plugin.vectorLoadWorkers` | 默认 4，测试可设为 1；挂在插件实例上，无包级可变状态 |
+| `Plugin.vectorReadyTimeout` | 默认 2s，测试可缩短 |
+| `Plugin.tableLoadTimeout` | 默认 30s，测试可缩短 |
 | `randFloat` | 随机参与与概率边界 |
 
 不引入第三方 mock 库；并发与关闭用 `sync.WaitGroup` 与显式计数验证。

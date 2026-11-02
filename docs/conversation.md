@@ -36,7 +36,9 @@
 | `Text` | string | 渲染后的文本，含非文本段占位符 |
 | `Images` | []string | 图片 URL 有序列表；仅 `vision_enabled=true` 时非空；不参与字符预算 |
 | `IsSelf` | bool | 是否机器人自己的回复 |
-| `EventID` | string | 事件 ID；机器人回复为发送结果消息 ID（可能为空） |
+| `IsBot` | bool | 发送者是否为机器人；不参与历史渲染，仅用于参与者计数 |
+| `EventID` | string | 事件 ID；用于记忆来源，机器人回复为发送结果消息 ID（可能为空） |
+| `MessageID` | string | 入站平台消息 ID；机器人回复为发送结果消息 ID（可能为空）。`reply_quote` 只使用该字段 |
 
 写入规则：
 

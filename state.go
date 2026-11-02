@@ -46,6 +46,7 @@ type sessionState struct {
 	epoch           uint64
 
 	timer         timerHandle
+	timerSeq      uint64
 	firstAt       time.Time
 	nextBatchAt   time.Time
 	pending       []Turn
@@ -164,6 +165,7 @@ func (p *Plugin) loadSessionOverride(s *sessionState) {
 		return
 	}
 	s.overrideLoading = true
+	epoch := s.epoch
 	s.mu.Unlock()
 
 	started := p.runBackground(func() {
@@ -172,7 +174,8 @@ func (p *Plugin) loadSessionOverride(s *sessionState) {
 		defer s.mu.Unlock()
 		s.overrideLoading = false
 		s.overrideLoaded = true
-		if s.overrideClosed {
+		if s.overrideClosed || s.epoch != epoch {
+			s.closeOverrideLocked()
 			return
 		}
 		if err != nil {
@@ -299,6 +302,7 @@ func (p *Plugin) removeSession(key string) *sessionState {
 	s.firstAt = time.Time{}
 	s.nextBatchAt = time.Time{}
 	s.epoch++
+	s.closeOverrideLocked()
 	s.mu.Unlock()
 	return s
 }
@@ -321,6 +325,7 @@ func (p *Plugin) invalidateAllSessions() {
 		s.firstAt = time.Time{}
 		s.nextBatchAt = time.Time{}
 		s.epoch++
+		s.closeOverrideLocked()
 		s.mu.Unlock()
 	}
 }

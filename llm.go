@@ -124,10 +124,22 @@ func newChatCompleter(cfg *config, client *http.Client, log *slog.Logger) chatCo
 		timeout:      cfg.LLMTimeout,
 		maxRetries:   cfg.LLMMaxRetries,
 		extraHeaders: cfg.LLMExtraHeaders,
-		client:       client,
+		client:       noRedirectClient(client),
 		log:          log,
 		debug:        cfg.DebugPrompts,
 	}
+}
+
+// noRedirectClient 克隆 client 并禁止自动重定向，避免 3xx 跨域重放请求头。
+func noRedirectClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	clone := *client
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone
 }
 
 type chatWireMessage struct {
@@ -265,9 +277,14 @@ func httpPostOnce(ctx context.Context, client *http.Client, endpoint, apiKey str
 		return nil, classifyNetworkError(ctx, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	limit := int64(8 << 20)
+	if resp.StatusCode != http.StatusOK {
+		limit = 4096
+	}
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
 	log.Debug("http request",
 		"operation", operation,
+		"method", http.MethodPost,
 		"url", logURL(endpoint),
 		"status", resp.StatusCode,
 		"duration_ms", time.Since(start).Milliseconds(),

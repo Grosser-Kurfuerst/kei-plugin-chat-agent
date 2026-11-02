@@ -32,7 +32,7 @@
 | P5 知识库 | `knowledge.go`、抓取、HTML 提取、分块、文档命令 | SSRF/重定向/Content-Type/分块/幂等/删除单测通过 |
 | P6 RAG 注入 | `rag.go`、双库检索、预算、提示词块、降级 | 注入格式、预算丢弃顺序、未就绪/错误降级单测通过 |
 | P7 管理员与调度 | `admin.go`、`scheduler.go`、`commands.go`、两个任务、审计 | 双管理员、最后管理员、持久化、任务互斥、状态输出单测通过 |
-| P8 联调 | mock 适配器端到端、竞态/关闭、文档对齐、质量门 | 端到端 8 个场景通过；`go test -race` 通过；文档校验通过 |
+| P8 联调 | mock 适配器端到端、竞态/关闭、文档对齐、质量门 | 端到端 7 个场景通过；`go test -race` 通过；文档校验通过 |
 
 统一验收：
 
@@ -71,6 +71,8 @@ P8 另加：
 | 记忆强化延迟落库 | `Stop` 可能丢失少量强化计数 | 接受；下轮整理落库 |
 | 模型/维度变更需 reindex | 额外 Embedding 成本 | 变更后执行 `/chat vector reindex` |
 | 任务只在单机运行 | 无分布式协调与多实例共享 | 单实例部署 |
+| 自定义 RoundTripper 无法拨号固定 | 仅能请求前解析校验，仍有 DNS rebinding 窗口；默认/`*http.Transport` 宿主 client 已拨号固定 | 生产使用默认 transport 或 `*http.Transport`；派生 client 禁用代理 |
+| e2e 只覆盖内存存储 | SQLite/MySQL 后端未在 `e2e_test.go` 中装配验证 | 由库测试与手工宿主验证补齐 |
 
 ### 16.4 假设与兜底
 
@@ -101,7 +103,7 @@ P8 另加：
 
 ## 相关文档
 
-- 文档索引：`README.md` §1。
+- 文档索引：[`docs/README.md`](README.md)。
 - 架构与生命周期：[`architecture.md`](architecture.md) 第 1-6 章。
 - 配置键：[`configuration.md §13.1`](configuration.md#131-权威配置键表)。
 - 命令：[`admin.md §14.2-14.3`](admin.md#142-命令语法)。

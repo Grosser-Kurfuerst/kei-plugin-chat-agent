@@ -284,19 +284,26 @@ func loadConfig(c *bot.Config) (*config, error) {
 }
 
 func (c *config) validate(raw map[string]any) error {
+	if err := validateScalarTypes(raw); err != nil {
+		return err
+	}
 	// 名单与准入
 	if err := validateMode(raw, "group_policy", c.GroupPolicy); err != nil {
 		return err
 	}
-	if err := validateListEntries(raw, "group_list"); err != nil {
+	if err := validatePolicyListEntries(raw, "group_list"); err != nil {
 		return err
 	}
 	if err := validateMode(raw, "private_policy", c.PrivatePolicy); err != nil {
 		return err
 	}
-	if err := validateListEntries(raw, "private_list"); err != nil {
+	if err := validatePolicyListEntries(raw, "private_list"); err != nil {
 		return err
 	}
+	c.GroupList = normalizePlatformEntries(c.GroupList)
+	c.PrivateList = normalizePlatformEntries(c.PrivateList)
+	c.SuperAdmins = normalizePlatformEntries(c.SuperAdmins)
+	c.SelfIDs = normalizePlatformEntries(c.SelfIDs)
 	for _, key := range []string{"self_ids", "trigger_keywords"} {
 		if err := validateListEntries(raw, key); err != nil {
 			return err
@@ -577,9 +584,9 @@ func readString(raw map[string]any, key, def string) string {
 	}
 	switch t := v.(type) {
 	case string:
-		return t
+		return strings.TrimSpace(t)
 	default:
-		return fmt.Sprint(t)
+		return strings.TrimSpace(fmt.Sprint(t))
 	}
 }
 
@@ -745,6 +752,168 @@ func validateListEntries(raw map[string]any, key string) error {
 	return nil
 }
 
+func validatePolicyListEntries(raw map[string]any, key string) error {
+	if err := validateListEntries(raw, key); err != nil {
+		return err
+	}
+	list, _ := parseStringList(raw[key])
+	for _, entry := range list {
+		platform, id, ok := strings.Cut(entry, ":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(platform) == "" || strings.TrimSpace(id) == "" {
+			return configError(raw, key, "条目必须是 platform:id")
+		}
+	}
+	return nil
+}
+
+func normalizePlatformEntry(s string) string {
+	platform, id, ok := strings.Cut(strings.TrimSpace(s), ":")
+	if !ok {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(platform) + ":" + strings.TrimSpace(id)
+}
+
+func normalizePlatformEntries(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = normalizePlatformEntry(s)
+	}
+	return out
+}
+
+func validateScalarTypes(raw map[string]any) error {
+	boolKeys := []string{
+		"ignore_bots", "respond_to_commands", "random_enabled", "reply_mention_sender",
+		"reply_quote", "reply_dedupe", "debug_prompts", "vision_enabled",
+		"memory_enabled", "rag_enabled", "knowledge_url_allow_private", "jobs_run_on_start",
+	}
+	intKeys := []string{
+		"trigger_min_chars", "random_max_per_hour", "random_min_participants",
+		"limits_max_concurrent", "reply_max_chars", "history_max_messages", "history_max_chars",
+		"history_max_sessions", "context_max_messages", "context_max_chars", "llm_max_tokens",
+		"llm_max_retries", "embedding_dimensions", "embedding_max_retries", "vector_max_records",
+		"memory_consolidate_max_sessions", "memory_consolidate_max_messages", "memory_extract_max",
+		"memory_extract_min_messages", "memory_top_k", "memory_context_max_chars",
+		"rag_context_max_chars", "knowledge_top_k", "knowledge_context_max_chars",
+		"knowledge_chunk_chars", "knowledge_chunk_overlap", "knowledge_max_bytes",
+	}
+	floatKeys := []string{
+		"mention_reply_probability", "random_probability", "llm_temperature",
+		"memory_dedupe_threshold", "memory_min_score", "memory_min_importance", "knowledge_min_score",
+	}
+	durationKeys := []string{
+		"mention_min_interval", "random_cooldown", "random_activity_window", "batch_window",
+		"batch_max_window", "history_ttl", "history_unconsolidated_ttl", "history_cleanup_interval",
+		"llm_timeout", "embedding_timeout", "memory_consolidate_interval",
+		"memory_consolidate_timeout", "memory_importance_decay_half_life", "memory_ttl",
+	}
+	stringKeys := []string{
+		"group_policy", "private_policy", "bot_name", "system_prompt", "llm_base_url",
+		"llm_api_key", "llm_model", "llm_skip_token", "embedding_base_url", "embedding_api_key",
+		"embedding_model", "random_quiet_hours", "random_timezone",
+	}
+	for _, key := range boolKeys {
+		if v, ok := raw[key]; ok && v != nil && !validBoolValue(v) {
+			return configError(raw, key, "必须是布尔值")
+		}
+	}
+	for _, key := range intKeys {
+		if v, ok := raw[key]; ok && v != nil && !validIntValue(v) {
+			return configError(raw, key, "必须是整数")
+		}
+	}
+	for _, key := range floatKeys {
+		if v, ok := raw[key]; ok && v != nil {
+			if !validNumberValue(v) {
+				return configError(raw, key, "必须是数字")
+			}
+		}
+	}
+	for _, key := range durationKeys {
+		if v, ok := raw[key]; ok && v != nil && !validDurationValue(v) {
+			return configError(raw, key, "必须是时长")
+		}
+	}
+	for _, key := range stringKeys {
+		if v, ok := raw[key]; ok && v != nil {
+			if _, ok := v.(string); !ok {
+				return configError(raw, key, "必须是字符串")
+			}
+		}
+	}
+	return nil
+}
+
+func validBoolValue(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return true
+	case string:
+		_, err := strconv.ParseBool(strings.TrimSpace(t))
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func validIntValue(v any) bool {
+	switch t := v.(type) {
+	case int:
+		return true
+	case int64:
+		return int64(int(t)) == t
+	case float64:
+		return !math.IsNaN(t) && !math.IsInf(t, 0) && math.Trunc(t) == t &&
+			t >= float64(-int(^uint(0)>>1)-1) && t <= float64(int(^uint(0)>>1))
+	case string:
+		_, err := strconv.Atoi(strings.TrimSpace(t))
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func validNumberValue(v any) bool {
+	switch t := v.(type) {
+	case int:
+		return true
+	case int64:
+		return true
+	case float32:
+		return !math.IsNaN(float64(t)) && !math.IsInf(float64(t), 0)
+	case float64:
+		return !math.IsNaN(t) && !math.IsInf(t, 0)
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return false
+	}
+}
+
+func validDurationValue(v any) bool {
+	switch t := v.(type) {
+	case time.Duration:
+		return true
+	case int, int64:
+		return true
+	case float64:
+		return !math.IsNaN(t) && !math.IsInf(t, 0)
+	case string:
+		_, err := time.ParseDuration(strings.TrimSpace(t))
+		return err == nil
+	default:
+		return false
+	}
+}
+
 func dedupeStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -858,8 +1027,8 @@ func positiveDuration(v time.Duration) string {
 }
 
 func validPlatformUser(s string) bool {
-	platform, userID, ok := strings.Cut(s, ":")
-	return ok && strings.TrimSpace(platform) != "" && strings.TrimSpace(userID) != ""
+	platform, userID, ok := strings.Cut(normalizePlatformEntry(s), ":")
+	return ok && platform != "" && userID != ""
 }
 
 func validateURLString(raw map[string]any, key, value string, allowEmpty bool) error {
@@ -875,7 +1044,7 @@ func validateURLString(raw map[string]any, key, value string, allowEmpty bool) e
 		return configError(raw, key, "必须是带 host 的 http(s) URL")
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if (scheme != "http" && scheme != "https") || u.Host == "" {
+	if (scheme != "http" && scheme != "https") || u.Hostname() == "" {
 		return configError(raw, key, "必须是带 host 的 http(s) URL")
 	}
 	if u.User != nil {

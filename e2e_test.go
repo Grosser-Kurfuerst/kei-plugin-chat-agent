@@ -554,6 +554,8 @@ func TestE2EImageRecognitionAndMemory(t *testing.T) {
 	defer imgSrv.Close()
 	store := newMemStore()
 	h := startE2E(t, store, srv.URL, nil)
+	// 端到端图片服务器在回环地址；生产受限 client 会拒绝它，测试显式注入。
+	h.p.visionClient = imgSrv.Client()
 	ev := e2eGroup("img-msg", "u1", "看看这个", "g9", "bot")
 	ev.Message.Segments = append(ev.Message.Segments, bot.Segment{
 		Type: bot.SegImage, Data: map[string]any{bot.KeyURL: imgSrv.URL + "/a.png"},
@@ -595,8 +597,12 @@ func TestE2EImageRecognitionAndMemory(t *testing.T) {
 	h.stop(t)
 
 	h2 := startE2E(t, store, srv.URL, nil)
-	if got, _ := h2.command(t, "chat", "memory search 部署拓扑", "admin"); !strings.Contains(got, "memory search: 1 条结果") {
+	if got, _ := h2.command(t, "chat", "memory search 部署拓扑", "admin"); got != "memory search: 已开始" {
 		t.Fatalf("memory search after restart=%q", got)
+	}
+	sent := h2.waitSent(t, 2)
+	if len(sent) < 2 || !strings.Contains(messageText(sent[1].Message), "memory search: 1 条结果") {
+		t.Fatalf("memory search result=%v", sent)
 	}
 }
 

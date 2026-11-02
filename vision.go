@@ -24,39 +24,71 @@ const (
 	visionMaxRedirects = 3
 )
 
-var visionAllowedFormats = []string{"image/jpeg", "image/png", "image/gif", "image/webp"}
+func allowedImageMIME(mime string) bool {
+	switch mime {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
 
 // newVisionClient 从宿主 transport 派生受限图片下载客户端，不修改宿主客户端。
 func newVisionClient(host *http.Client) *http.Client {
+	return newRestrictedClient(host, false)
+}
+
+// newRestrictedClient 克隆宿主 client，并把拨号限制到非回环/私网地址。
+// 派生 client 明确禁用代理，避免代理侧解析目标地址绕过校验。
+func newRestrictedClient(host *http.Client, allowPrivate bool) *http.Client {
 	if host == nil {
 		host = http.DefaultClient
 	}
 	clone := *host
-	if host.Transport == nil {
-		tr, ok := http.DefaultTransport.(*http.Transport)
+	switch tr := host.Transport.(type) {
+	case nil:
+		base, ok := http.DefaultTransport.(*http.Transport)
 		if !ok {
-			tr = &http.Transport{}
+			base = &http.Transport{}
 		} else {
-			tr = tr.Clone()
+			base = base.Clone()
 		}
-		tr.DialContext = safeDialContext(tr.DialContext)
-		clone.Transport = tr
-	} else if tr, ok := host.Transport.(*http.Transport); ok {
-		tr2 := tr.Clone()
-		// 自定义 DialContext 视为测试注入，保留其行为（可绕过地址限制）。
-		if tr.DialContext == nil {
-			tr2.DialContext = safeDialContext(nil)
-		}
-		clone.Transport = tr2
+		base.Proxy = nil
+		base.DialContext = safeDialContext(base.DialContext, allowPrivate)
+		clone.Transport = base
+	case *http.Transport:
+		base := tr.Clone()
+		base.Proxy = nil
+		base.DialContext = safeDialContext(base.DialContext, allowPrivate)
+		clone.Transport = base
+	default:
+		clone.Transport = validatingTransport{base: tr, allowPrivate: allowPrivate}
 	}
 	return &clone
 }
 
+// validatingTransport 为无法注入 DialContext 的自定义 RoundTripper 提供
+// 请求前地址校验；它不能像拨号固定那样完全消除 DNS rebinding 窗口。
+type validatingTransport struct {
+	base         http.RoundTripper
+	allowPrivate bool
+}
+
+func (t validatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, err := validateKnowledgeURL(req.Context(), req.URL.String(), t.allowPrivate); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(req)
+}
+
 // safeDialContext 在拨号前解析并拒绝回环/私网/保留地址。
-func safeDialContext(base func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+func safeDialContext(base func(ctx context.Context, network, addr string) (net.Conn, error), allowPrivate bool) func(context.Context, string, string) (net.Conn, error) {
 	if base == nil {
 		d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 		base = d.DialContext
+	}
+	if allowPrivate {
+		return base
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -103,7 +135,8 @@ func (p *Plugin) fetchImagesForChat(ctx context.Context, turns []Turn) map[uint6
 	fetchCtx, cancel := context.WithTimeout(ctx, visionFetchTimeout)
 	defer cancel()
 	success := 0
-	for i := len(turns) - 1; i >= 0 && success < visionMaxImagesPerRequest; i-- {
+	limitLogged := false
+	for i := len(turns) - 1; i >= 0; i-- {
 		t := turns[i]
 		if len(t.Images) == 0 {
 			continue
@@ -112,7 +145,14 @@ func (p *Plugin) fetchImagesForChat(ctx context.Context, turns []Turn) map[uint6
 		if aligned == nil {
 			aligned = make([]*imageAttachment, len(t.Images))
 		}
-		for j := len(t.Images) - 1; j >= 0 && success < visionMaxImagesPerRequest; j-- {
+		for j := len(t.Images) - 1; j >= 0; j-- {
+			if success >= visionMaxImagesPerRequest {
+				if !limitLogged {
+					p.logVisionFailure("limit", t.Images[j], 0)
+					limitLogged = true
+				}
+				continue
+			}
 			att, reason := p.fetchImage(fetchCtx, t.Images[j])
 			if att == nil {
 				p.logVisionFailure(reason, t.Images[j], 0)
@@ -268,15 +308,6 @@ func stripMimeParams(s string) string {
 		s = s[:i]
 	}
 	return strings.ToLower(strings.TrimSpace(s))
-}
-
-func allowedImageMIME(mime string) bool {
-	for _, allowed := range visionAllowedFormats {
-		if mime == allowed {
-			return true
-		}
-	}
-	return false
 }
 
 func (p *Plugin) logVisionFailure(reason, rawURL string, bytes int) {

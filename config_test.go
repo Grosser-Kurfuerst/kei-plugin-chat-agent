@@ -273,3 +273,51 @@ func TestConfigVisionDefaultAndBoolean(t *testing.T) {
 		t.Fatal("vision true / memory false not accepted")
 	}
 }
+
+func TestConfigRejectsMalformedScalarsAndNormalizes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want string
+	}{
+		{"bool", map[string]any{"vision_enabled": "maybe"}, "chat-agent: 配置错误 vision_enabled=maybe: 必须是布尔值"},
+		{"duration", map[string]any{"batch_window": "abc"}, "chat-agent: 配置错误 batch_window=abc: 必须是时长"},
+		{"int", map[string]any{"reply_max_chars": "abc"}, "chat-agent: 配置错误 reply_max_chars=abc: 必须是整数"},
+		{"number", map[string]any{"llm_temperature": "NaN"}, "chat-agent: 配置错误 llm_temperature=NaN: 必须是数字"},
+		{"string", map[string]any{"llm_model": 123}, "chat-agent: 配置错误 llm_model=123: 必须是字符串"},
+		{"url host", map[string]any{"llm_base_url": "http://:8080"}, "chat-agent: 配置错误 llm_base_url=http://:8080: 必须是带 host 的 http(s) URL"},
+		{"platform list", map[string]any{"group_list": []string{"telegram:"}}, "chat-agent: 配置错误 group_list=[telegram:]: 条目必须是 platform:id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := map[string]any{"llm_model": "m", "embedding_model": "e"}
+			for k, v := range tc.raw {
+				raw[k] = v
+			}
+			_, err := loadConfig(bot.NewConfig(raw))
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("err=%v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	cfg := mustConfig(t, map[string]any{
+		"llm_base_url": " https://api.example.com/v1 ",
+		"llm_model":    " model ",
+		"super_admins": []string{"telegram: 42"},
+		"group_list":   []string{" telegram : -1 "},
+		"self_ids":     []string{"telegram: bot "},
+	})
+	if cfg.LLMBaseURL != "https://api.example.com/v1" || cfg.LLMModel != "model" {
+		t.Fatalf("string trim: base=%q model=%q", cfg.LLMBaseURL, cfg.LLMModel)
+	}
+	if got := strings.Join(cfg.SuperAdmins, ","); got != "telegram:42" {
+		t.Fatalf("admins=%q", got)
+	}
+	if got := strings.Join(cfg.GroupList, ","); got != "telegram:-1" {
+		t.Fatalf("group list=%q", got)
+	}
+	if got := strings.Join(cfg.SelfIDs, ","); got != "telegram:bot" {
+		t.Fatalf("self ids=%q", got)
+	}
+}

@@ -3,6 +3,8 @@ package chatagent
 import (
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -209,6 +211,39 @@ func systemContent(prompt, memoryBlock, knowledgeBlock string) string {
 	return b.String()
 }
 
+// removeStandaloneToken 只删除以空白分隔的完整 token，避免误删词内子串。
+func removeStandaloneToken(text, token string) string {
+	if token == "" {
+		return text
+	}
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		j := strings.Index(text[i:], token)
+		if j < 0 {
+			b.WriteString(text[i:])
+			break
+		}
+		start := i + j
+		end := start + len(token)
+		before := start == 0
+		if !before {
+			r, _ := utf8.DecodeLastRuneInString(text[:start])
+			before = unicode.IsSpace(r)
+		}
+		after := end == len(text)
+		if !after {
+			r, _ := utf8.DecodeRuneInString(text[end:])
+			after = unicode.IsSpace(r)
+		}
+		b.WriteString(text[i:start])
+		if !(before && after) {
+			b.WriteString(token)
+		}
+		i = end
+	}
+	return b.String()
+}
+
 // cleanReply 清洗 LLM 回复；返回 skip 表示随机轮次识别到 skip token。
 func cleanReply(raw string, random bool, cfg *config) (text string, skipped bool, empty bool) {
 	text = strings.ReplaceAll(raw, "\r\n", "\n")
@@ -218,7 +253,7 @@ func cleanReply(raw string, random bool, cfg *config) (text string, skipped bool
 		if text == token {
 			return "", true, false
 		}
-		text = strings.ReplaceAll(text, token, "")
+		text = removeStandaloneToken(text, token)
 		text = strings.TrimSpace(text)
 		if text == "" {
 			return "", true, false

@@ -48,7 +48,7 @@ func newHTTPEmbedder(cfg *config, client *http.Client, log *slog.Logger) embedde
 		timeout:      cfg.EmbeddingTimeout,
 		maxRetries:   cfg.EmbeddingMaxRetries,
 		extraHeaders: cfg.EmbeddingExtraHeaders,
-		client:       client,
+		client:       noRedirectClient(client),
 		log:          log,
 		debug:        cfg.DebugPrompts,
 	}

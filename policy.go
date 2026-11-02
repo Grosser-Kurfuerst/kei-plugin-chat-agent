@@ -104,9 +104,12 @@ func decodeStringList(raw json.RawMessage) ([]string, error) {
 	}
 	trimmed := make([]string, 0, len(list))
 	for _, s := range list {
-		s = strings.TrimSpace(s)
+		s = normalizePlatformEntry(s)
 		if s == "" {
 			return nil, errors.New("empty list entry")
+		}
+		if platform, id, ok := strings.Cut(s, ":"); ok && (platform == "" || id == "") {
+			return nil, errors.New("invalid platform entry")
 		}
 		trimmed = append(trimmed, s)
 	}

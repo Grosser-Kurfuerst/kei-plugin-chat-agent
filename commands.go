@@ -2,10 +2,12 @@ package chatagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/RandomLemon/kei/pkg/bot"
 )
@@ -57,6 +59,9 @@ const (
 
 // handleCommand 是 `/chat` 与 `/chat-admin` 的共同入口。
 func (p *Plugin) handleCommand(ctx context.Context, ev *bot.Event, r bot.Reply) error {
+	if p.stopping.Load() {
+		return nil
+	}
 	start := time.Now()
 	commandName := "chat"
 	if ev != nil && ev.Command != nil && ev.Command.Name == "chat-admin" {
@@ -243,7 +248,7 @@ func (p *Plugin) commandList(args []string) string {
 	if len(args) != 4 {
 		return paramError("list 需要 <group|private> add|del <id>")
 	}
-	kind, op, id := args[1], args[2], strings.TrimSpace(args[3])
+	kind, op, id := args[1], args[2], normalizePlatformEntry(args[3])
 	if kind != "group" && kind != "private" {
 		return paramError("list 类型必须是 group 或 private")
 	}
@@ -255,12 +260,14 @@ func (p *Plugin) commandList(args []string) string {
 	}
 	switch op {
 	case "add":
-		p.policy.addEntry(kind, id)
-		p.persistPolicy()
+		if p.policy.addEntry(kind, id) {
+			p.persistPolicy()
+		}
 		return fmt.Sprintf("list %s: 已添加 %s", kind, id)
 	default:
-		p.policy.delEntry(kind, id)
-		p.persistPolicy()
+		if p.policy.delEntry(kind, id) {
+			p.persistPolicy()
+		}
 		return fmt.Sprintf("list %s: 已删除 %s", kind, id)
 	}
 }
@@ -300,21 +307,24 @@ func (p *Plugin) commandAdmins(args []string) string {
 	if len(args) != 3 {
 		return paramError("admins 需要 list|add <id>|del <id>|reset")
 	}
-	id := strings.TrimSpace(args[2])
+	id := normalizePlatformEntry(args[2])
 	if !validPlatformUser(id) {
 		return paramError("管理员条目必须是 platform:userID")
 	}
 	switch args[1] {
 	case "add":
-		p.admins.add(id)
-		p.persistAdmins()
+		if p.admins.add(id) {
+			p.persistAdmins()
+		}
 		return "admins: 已添加 " + id
 	case "del":
-		_, last := p.admins.del(id)
+		removed, last := p.admins.del(id)
 		if last {
 			return lastAdminLine
 		}
-		p.persistAdmins()
+		if removed {
+			p.persistAdmins()
+		}
 		return "admins: 已删除 " + id
 	default:
 		return paramError("admins 需要 list|add <id>|del <id>|reset")
@@ -340,7 +350,25 @@ func (p *Plugin) commandMemory(ctx context.Context, ev *bot.Event, cmd *bot.Comm
 		if query == "" {
 			return paramError("memory search 需要查询文本")
 		}
-		return p.memorySearchText(ctx, ev, query)
+		if p.cfg.MemoryTopK == 0 {
+			return "memory search: 无结果"
+		}
+		if !p.jobs.tryExclusive("memory") {
+			return "chat-agent: 忙碌: memory"
+		}
+		target := sessionTargetFromEvent(ev)
+		p.deferCommandTask(ctx, func() {
+			defer p.jobs.finish("memory")
+			taskCtx, cancel := context.WithTimeout(p.ctx, p.cfg.EmbeddingTimeout)
+			defer cancel()
+			out, err := p.memorySearchText(taskCtx, ev, query)
+			if err != nil {
+				p.sendAsync(target, "memory search: 失败 "+memoryFailureReason(err))
+				return
+			}
+			p.sendAsync(target, out)
+		})
+		return "memory search: 已开始"
 	case "add":
 		text := strings.TrimSpace(subRaw(cmd.Raw, 2))
 		if text == "" {
@@ -430,11 +458,14 @@ func (p *Plugin) memoryDel(ctx context.Context, ev *bot.Event, id string) string
 		defer p.jobs.finish("memory")
 		taskCtx, cancel := context.WithTimeout(p.ctx, p.cfg.MemoryConsolidateTimeout)
 		defer cancel()
+		entry, claimed := p.idx.claimMemory(id)
 		if err := p.deleteRowWait(taskCtx, memoryRowKey(id)); err != nil {
-			p.sendAsync(target, "memory: 失败 storage_error")
+			if claimed {
+				p.idx.restoreMemory(entry)
+			}
+			p.sendAsync(target, "memory: 失败 "+storageFailureReason(err))
 			return
 		}
-		p.idx.removeMemory(id)
 		p.sendAsync(target, "memory: 完成 "+id)
 	})
 	return "memory: 已接受"
@@ -449,20 +480,35 @@ func (p *Plugin) memoryReset(ctx context.Context, ev *bot.Event) string {
 		defer p.jobs.finish("memory")
 		taskCtx, cancel := context.WithTimeout(p.ctx, p.cfg.MemoryConsolidateTimeout)
 		defer cancel()
-		failed := false
+		var failure error
 		for _, m := range p.idx.memorySnapshot() {
-			if taskCtx.Err() != nil {
-				failed = true
+			if err := taskCtx.Err(); err != nil {
+				failure = err
 				break
 			}
-			if err := p.deleteRowWait(taskCtx, memoryRowKey(m.ID)); err != nil {
-				failed = true
+			entry, claimed := p.idx.claimMemory(m.ID)
+			if !claimed {
 				continue
 			}
-			p.idx.removeMemory(m.ID)
+			if err := p.deleteRowWait(taskCtx, memoryRowKey(m.ID)); err != nil {
+				p.idx.restoreMemory(entry)
+				failure = err
+				continue
+			}
 		}
-		if failed {
-			p.sendAsync(target, "memory: 失败 storage_error")
+		for _, key := range p.idx.badMemoryKeys() {
+			if err := taskCtx.Err(); err != nil {
+				failure = err
+				break
+			}
+			if err := p.deleteRowWait(taskCtx, key); err != nil {
+				failure = err
+				continue
+			}
+			p.idx.removeBadMemoryKey(key)
+		}
+		if failure != nil {
+			p.sendAsync(target, "memory: 失败 "+storageFailureReason(failure))
 			return
 		}
 		p.sendAsync(target, "memory: 完成 reset")
@@ -470,19 +516,38 @@ func (p *Plugin) memoryReset(ctx context.Context, ev *bot.Event) string {
 	return "memory: 已接受"
 }
 
-func (p *Plugin) memorySearchText(ctx context.Context, ev *bot.Event, query string) string {
-	taskCtx, cancel := context.WithTimeout(p.ctx, p.cfg.EmbeddingTimeout)
-	defer cancel()
-	vecs, err := p.embedder.Embed(taskCtx, []string{takePrefix(query, contextMessageMaxChars)})
+func storageFailureReason(err error) string {
+	switch categoryOf(err) {
+	case errTimeout:
+		return "timeout"
+	case errCanceled:
+		return "internal_error"
+	default:
+		return "storage_error"
+	}
+}
+
+func (p *Plugin) memorySearchText(ctx context.Context, ev *bot.Event, query string) (string, error) {
+	if p.cfg.MemoryTopK == 0 {
+		return "memory search: 无结果", nil
+	}
+	vecs, err := p.embedder.Embed(ctx, []string{takePrefix(query, contextMessageMaxChars)})
 	if err != nil {
-		return "memory: 失败 embedding_error"
+		switch categoryOf(err) {
+		case errTimeout:
+			return "", kerr("timeout", err)
+		case errCanceled:
+			return "", kerr("internal_error", err)
+		default:
+			return "", kerr("embedding_error", err)
+		}
 	}
 	if len(vecs) != 1 {
-		return "memory: 失败 embedding_error"
+		return "", kerr("embedding_error", errors.New("embedding count mismatch"))
 	}
 	vec, err := normalizeVector(vecs[0])
 	if err != nil {
-		return "memory: 失败 embedding_error"
+		return "", kerr("embedding_error", err)
 	}
 	kind := commandKind(ev)
 	channelID := ""
@@ -493,10 +558,10 @@ func (p *Plugin) memorySearchText(ctx context.Context, ev *bot.Event, query stri
 	if kind == "group" && ev.Channel != nil {
 		channelID = ev.Channel.ID
 	}
-	if p.cfg.MemoryTopK == 0 {
-		return "memory search: 无结果"
+	hits, mismatch := p.idx.searchMemories(vec, channelID, userIDs, p.cfg.MemoryTopK)
+	if mismatch > 0 {
+		p.log.Warn("memory search dimension mismatch", "operation", "memory", "skipped", mismatch)
 	}
-	hits, _ := p.idx.searchMemories(vec, channelID, userIDs, p.cfg.MemoryTopK)
 	type row struct {
 		id    string
 		score float64
@@ -520,14 +585,14 @@ func (p *Plugin) memorySearchText(ctx context.Context, ev *bot.Event, query stri
 		p.idx.reinforce(ids, p.now().UTC())
 	}
 	if len(rows) == 0 {
-		return "memory search: 无结果"
+		return "memory search: 无结果", nil
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "memory search: %d 条结果", len(rows))
 	for _, r := range rows {
 		fmt.Fprintf(&b, "\n%s %.3f %s %s", r.id, r.score, r.kind, r.text)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func (p *Plugin) commandKnowledge(ctx context.Context, ev *bot.Event, cmd *bot.Command, args []string) string {
@@ -797,13 +862,11 @@ func (p *Plugin) commandSession(ev *bot.Event) *sessionState {
 func subRaw(raw string, n int) string {
 	s := strings.TrimSpace(raw)
 	for range n {
-		i := strings.IndexFunc(s, func(r rune) bool {
-			return r == ' ' || r == '\t' || r == '\n' || r == '\r'
-		})
+		i := strings.IndexFunc(s, unicode.IsSpace)
 		if i < 0 {
 			return ""
 		}
-		s = strings.TrimLeft(s[i:], " \t\n\r")
+		s = strings.TrimLeftFunc(s[i:], unicode.IsSpace)
 	}
 	return s
 }

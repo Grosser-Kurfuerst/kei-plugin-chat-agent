@@ -144,7 +144,7 @@ func (s *scheduler) tryExclusive(name string) bool {
 	}
 	switch name {
 	case "consolidate":
-		if s.consolidateRunning {
+		if s.consolidateRunning || s.memoryCmdRunning || s.reindexRunning {
 			return false
 		}
 		s.consolidateRunning = true
@@ -154,12 +154,12 @@ func (s *scheduler) tryExclusive(name string) bool {
 		}
 		s.cleanupRunning = true
 	case "reindex":
-		if s.reindexRunning {
+		if s.reindexRunning || s.consolidateRunning || s.memoryCmdRunning {
 			return false
 		}
 		s.reindexRunning = true
 	case "memory":
-		if s.memoryCmdRunning {
+		if s.memoryCmdRunning || s.consolidateRunning || s.reindexRunning {
 			return false
 		}
 		s.memoryCmdRunning = true
@@ -369,6 +369,40 @@ func (p *Plugin) runCleanup(ctx context.Context) (string, error) {
 	return fmt.Sprintf("sessions_removed=%d histories_trimmed=%d", removed, trimmedSessions), nil
 }
 
+// reindexMemoryTarget 用版本校验更新一条 stale 记忆；返回是否成功、是否发生存储错误。
+func (p *Plugin) reindexMemoryTarget(ctx context.Context, m *memoryEntry, vec []float32) (ok, failed bool) {
+	if p.idx.isMemoryDeleted(m.ID) {
+		return false, false
+	}
+	cur, exists := p.idx.memoryByID(m.ID)
+	if !exists || cur.Version != m.Version {
+		return false, false
+	}
+	rec := *m
+	rec.Vector = vec
+	rec.Dims = len(vec)
+	rec.Model = p.cfg.EmbeddingModel
+	if err := p.putRowWait(ctx, memoryRowKey(rec.ID), marshalJSON(memoryRecordOf(&rec))); err != nil {
+		p.log.Warn("reindex memory write failed", "operation", "vector", "error", err.Error())
+		return false, true
+	}
+	if !p.idx.applyReindexMemory(rec.ID, m.Version, vec, p.cfg.EmbeddingModel) {
+		// 并发合并或删除：用当前内存状态恢复行，避免旧快照覆盖新写入。
+		if current, exists := p.idx.memoryByID(rec.ID); exists {
+			if err := p.putRowWait(ctx, memoryRowKey(current.ID), marshalJSON(memoryRecordOf(current))); err != nil {
+				p.log.Warn("reindex restore failed", "operation", "vector", "error", err.Error())
+			}
+		} else if p.idx.isMemoryDeleted(rec.ID) {
+			if err := p.deleteRowWait(ctx, memoryRowKey(rec.ID)); err != nil {
+				p.log.Warn("reindex deleted memory cleanup failed",
+					"operation", "vector", "error", err.Error())
+			}
+		}
+		return false, false
+	}
+	return true, false
+}
+
 // runReindex 重新嵌入 stale 记录；部分失败时保留旧 meta。
 func (p *Plugin) runReindex(ctx context.Context) (int, error) {
 	state := p.idx.statusState()
@@ -426,37 +460,13 @@ func (p *Plugin) runReindex(ctx context.Context) (int, error) {
 		}
 		t := targets[i]
 		if t.memory != nil {
-			if p.idx.isMemoryDeleted(t.memory.ID) {
-				continue
-			}
-			cur, ok := p.idx.memoryByID(t.memory.ID)
-			if !ok || cur.Version != t.memory.Version {
-				continue
-			}
-			rec := *t.memory
-			rec.Vector = vec
-			rec.Dims = len(vec)
-			rec.Model = p.cfg.EmbeddingModel
-			if err := p.putRowWait(ctx, memoryRowKey(rec.ID), marshalJSON(memoryRecordOf(&rec))); err != nil {
-				p.log.Warn("reindex memory write failed", "operation", "vector", "error", err.Error())
+			ok, failed := p.reindexMemoryTarget(ctx, t.memory, vec)
+			if failed {
 				allOK = false
-				continue
 			}
-			if !p.idx.applyReindexMemory(rec.ID, t.memory.Version, vec, p.cfg.EmbeddingModel) {
-				// 并发合并或删除：用当前内存状态恢复行，避免旧快照覆盖新写入。
-				if current, exists := p.idx.memoryByID(rec.ID); exists {
-					if err := p.putRowWait(ctx, memoryRowKey(current.ID), marshalJSON(memoryRecordOf(current))); err != nil {
-						p.log.Warn("reindex restore failed", "operation", "vector", "error", err.Error())
-					}
-				} else if p.idx.isMemoryDeleted(rec.ID) {
-					if err := p.deleteRowWait(ctx, memoryRowKey(rec.ID)); err != nil {
-						p.log.Warn("reindex deleted memory cleanup failed",
-							"operation", "vector", "error", err.Error())
-					}
-				}
-				continue
+			if ok {
+				success++
 			}
-			success++
 			continue
 		}
 		if _, ok := p.idx.chunkByID(t.chunk.ID); !ok {

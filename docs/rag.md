@@ -38,7 +38,7 @@
 URL 校验：
 
 - 只允许 `http` 与 `https`；必须带 host；不得包含 userinfo。
-- `knowledge_url_allow_private=false` 时，host 解析出的每个 IP 都必须通过地址段校验；任何一跳失败即拒绝。
+- `knowledge_url_allow_private=false` 时，host 解析出的每个 IP 都必须通过地址段校验；任何一跳失败即拒绝。抓取使用派生自宿主 client 的受限 transport，在拨号时固定校验后的 IP，并禁用代理，避免二次 DNS 解析/代理绕过。
 - `knowledge_url_allow_private=true` 仅供测试，跳过私网/保留地址检查，但仍校验 scheme、host 与 userinfo。
 - 每一跳重定向都重新执行完整校验；相对 `Location` 先相对于当前 URL 解析。
 - 最多 3 跳重定向；超过、缺少 `Location` 或非 http(s) 目标都失败。
@@ -246,6 +246,7 @@ HTML 正文提取是启发式，不实现完整解析器：
 |---|---|---|
 | URL 解析/私网校验/跳转校验 | `url_rejected` | 不写入 |
 | DNS/连接/HTTP 状态/超时 | `fetch_error` 或 `timeout` | 不写入 |
+| 抓取被 ctx 取消（如 Stop） | `internal_error` | 不写入 |
 | Content-Type 不允许或缺失 | `unsupported_type` | 不写入 |
 | 响应体超过 `knowledge_max_bytes` | `too_large` | 不写入 |
 | 正文提取为空 | `empty_content` | 不写入 |

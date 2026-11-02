@@ -59,9 +59,9 @@ kei EventBus ──► Engine ──► Router
                              ▼
                   后台生成协程（全局信号量）
                              ▼
-            图片下载与多模态内容组装（vision_enabled）
-                             ▼
                  RAG 检索（记忆 + 知识库）
+                             ▼
+            图片下载与多模态内容组装（vision_enabled）
                              ▼
                      Chat Completions (LLM)
                              ▼
@@ -109,7 +109,7 @@ kei EventBus ──► Engine ──► Router
 | `vector` | 表行、`meta` | 内存索引、top-k | 跳过坏行并 warn |
 | `scheduler` | 两个 interval、手动命令 | 任务触发与状态 | `job_busy` 跳过 |
 | `commands` | 命令事件 | 同步输出、异步任务 | 固定错误文案 |
-| `storage` | 逻辑键、值、TTL、表行 | KV 与表持久化、单写队列 | warn 与计数，不 panic |
+| `storage` | 逻辑键、值、TTL、表行 | KV 与表持久化、单写队列 | warn，不 panic |
 
 ## 3. 生命周期与并发模型
 
@@ -158,16 +158,16 @@ reg.OnCommand("chat-admin", p.handleCommand,
 - 只有全部 `d:` 行解析成功时才回收未被任何文档 `chunk_ids` 引用的 `c:` 行；任一 `d:` 行非法时本轮跳过回收、保留分块并 warn。
 - 文档 `chunk_ids` 引用的分块不存在时 warn，文档与其余分块继续加载。
 - `meta` 缺失或非法时按配置与已有行推导，尽力写回；写回失败只 warn。
-- 行级错误不使 `Start` 失败；只有 `ListRows` 本身失败才失败。
+- 行级错误不使 `Start` 失败；`CreateTable` 非 `ErrTableExists` 或 `ListRows` 本身失败会使 `Start` 返回错误。
 
 #### Stop
 
 1. 标记关闭，拒绝新的写穿透、任务与生成排程。
 2. 停止两个 ticker。
-3. 排空写队列，等待 `writerDone`。
+3. 以剩余 `shutdown_wait_timeout`（或调用方更早的 deadline）排空写队列；写协程同时纳入 `wg`。
 4. 调用插件级 `cancel()`，终止生成、任务、Embedding 与索引构建。
-5. 失效所有会话 timer 与 pending，递增 `epoch`。
-6. `wg.Wait`，上限 `shutdown_wait_timeout=5s`；超时记录 Error `shutdown_incomplete` 并返回错误。
+5. 失效所有会话 timer 与 pending，递增 `epoch`，关闭向量索引（不得再置 `ready`）。
+6. `wg.Wait`，总期限 `shutdown_wait_timeout=5s`；排空或等待超时记录 Error `shutdown_incomplete` 并返回错误。
 7. 重复调用 `Stop` 是幂等的，直接返回。
 
 取消后仍在运行的索引构建必须尽快退出：退出前不得把 `state` 置为 `ready`，也不得再提交表行写入或发送消息。
@@ -194,12 +194,13 @@ reg.OnCommand("chat-admin", p.handleCommand,
 |---|---|---|
 | `sessionsMu` | 会话 map、LRU 顺序 | 不在锁内调用 Storage/网络 |
 | `session.mu` | 单个会话的全部字段 | 历史、pending、timer、inflight、epoch、计数器 |
-| `policyMu` | 名单模式与列表 | 命令写入与 Handler 读取 |
-| `adminsMu` | `super_admins` 集合 | 命令写入与校验 |
-| `vectorMu` | 内存索引、`meta` 快照、stale 计数 | 查询持读锁，重建持写锁 |
-| `writeMu`/`writeCond` | 写队列 | 单写协程与提交者 |
-| `jobMu` | 任务 running/last/next | try-lock |
-| `semaphore` | 全局生成并发 | channel 信号量 |
+| `policyStore.mu` | 名单模式与列表 | 命令写入与 Handler 读取 |
+| `adminStore.mu` | `super_admins` 集合 | 命令写入与校验 |
+| `vectorIndex.mu` | 内存索引、`meta` 快照、stale 计数 | 查询持读锁，重建持写锁 |
+| `vectorIndex.mu` + memory CAS | 记忆读改写、淘汰、reset/reindex 与强化落库 | 行写入后用版本 CAS 切换快照；不持锁做 Storage 调用 |
+| `writeQueue.mu`/`cond` | 写队列 | 单写协程与提交者 |
+| `scheduler.mu` | 任务 running/last/next | try-lock |
+| `Plugin.sem` | 全局生成并发 | channel 信号量 |
 
 禁止在持锁期间做网络、LLM、Embedding 或 Storage 调用。需要跨调用保持一致的字段先拷贝快照，调用后重新加锁校验 `epoch`。
 
@@ -211,7 +212,7 @@ reg.OnCommand("chat-admin", p.handleCommand,
 关闭准入 → 停止 ticker → 排空写队列 → cancel() → 失效 timer/pending、递增 epoch → wg.Wait
 ```
 
-先排空写队列再取消插件级 ctx，是为了保证持久化后端上最后一次名单/策略/管理员覆盖不被取消丢弃。取消后仍在途的生成结果可能被丢弃，但已经提交的写入必须保留。异步索引构建纳入 `wg`：`Stop` 取消后等待其退出，构建不得再置 `ready`、写表行或发送消息。`Stop` 返回后不得再调用 `BotAPI.Send`。
+`Stop` 开始时立即设置任务准入与 `runBackground` 拒绝标志，Handler、批处理 timer 与 `runBackground` 都不再接受新工作；先排空写队列再取消插件级 ctx，是为了保证持久化后端上最后一次名单/策略/管理员覆盖不被取消丢弃。取消后仍在途的生成结果可能被丢弃，但已经提交的写入必须保留。写协程与异步索引构建都纳入 `wg`：`Stop` 取消后等待其退出，构建不得再置 `ready`、写表行或发送消息。`Stop` 返回后不得再调用 `BotAPI.Send`。
 
 ### 3.5 调度器语义
 
@@ -228,7 +229,7 @@ reg.OnCommand("chat-admin", p.handleCommand,
 
 | 字段 | 含义 |
 |---|---|
-| `operation` | `message`、`generate`、`admin_command`、`consolidate`、`cleanup`、`knowledge`、`vector`、`vision`、`storage` |
+| `operation` | `message`、`generate`、`admin_command`、`consolidate`、`cleanup`、`knowledge`、`knowledge_refresh`、`vector`、`vision`、`storage` |
 | `reason` | 决策 reason 或失败原因 |
 | `rag_status` | `ok`、`disabled`、`loading`、`error`、`empty` |
 | `session` | 会话键的哈希前缀 |
@@ -249,6 +250,9 @@ reg.OnCommand("chat-admin", p.handleCommand,
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `key` | string | 内存会话键 |
+| `storageKey` | string | `session:<hash>` KV 键 |
+| `channelName` | string | 群聊显示名，可更新 |
+| `peerName` | string | 私聊对端显示名，可更新 |
 | `kind` | string | `group` 或 `private` |
 | `platform` | string | 平台名 |
 | `botID` | string | 机器人 ID |
@@ -260,9 +264,12 @@ reg.OnCommand("chat-admin", p.handleCommand,
 | `seq` | uint64 | 下一条历史的序号 |
 | `consolidatedSeq` | uint64 | 已被记忆整理消费到的位置 |
 | `lostSeq` | uint64 | 因裁剪丢失的未整理位置上界 |
-| `epoch` | uint64 | 会话代次，删除/重置时递增 |
-| `timer` | `*time.Timer` | 批处理定时器 |
+| `epoch` | uint64 | 会话代次，删除或 Stop 失效时递增 |
+| `timer` | `timerHandle` | 批处理定时器句柄 |
+| `timerSeq` | uint64 | 当前 timer 的布防序号 |
 | `firstAt` | time.Time | 当前批次第一条消息的时间 |
+| `nextBatchAt` | time.Time | 生成结束后下一批的强制时间 |
+| `pendingRandom` | bool | 当前 pending 批次是否来自随机插话 |
 | `pending` | `[]Turn` | 待生成队列：等待定时器或生成期间到达的消息 |
 | `inflight` | bool | 是否有生成在途 |
 | `lastReplyAt` | time.Time | 最近一次机器人回复时间 |
@@ -270,6 +277,10 @@ reg.OnCommand("chat-admin", p.handleCommand,
 | `recentReplyIDs` | `[]string` | 最近 128 条机器人发送的消息 ID |
 | `recentReplyTexts` | `[]replyFingerprint` | 最近 5 条机器人回复文本与时间 |
 | `recentSenders` | `[]senderMark` | 最近 `random_activity_window` 内的非机器人发送者 |
+| `overrideLoading` | bool | 是否正在异步加载 `session` 覆盖 |
+| `overrideLoaded` | bool | 覆盖是否已加载或已失效 |
+| `overrideClosed` | bool | 覆盖等待通道是否已关闭 |
+| `overrideDone` | `chan struct{}` | 覆盖加载完成信号 |
 
 `lastSeq` 指会话的 `seq`（下一条历史的序号）；`consolidatedSeq >= lastSeq` 表示没有未整理消息。`pending` 同时承载“等待定时器的当前批次”和“生成期间到达的下一批”，取批时整体移出。
 
@@ -352,7 +363,7 @@ KV 逻辑键（全部）：
 - 行写入统一 `putRow`：先 `UpdateRow`；返回 `bot.ErrNotFound` 时改 `InsertRow`；返回 `bot.ErrRowExists` 时重试一次 `UpdateRow`；其它错误返回 `storage_error`。
 - 删除行用 `DeleteRow`；行不存在按成功处理。
 - 内存索引只在对应行写成功后切换；失败保持旧快照。
-- 单次写超时 `storage_timeout=2s`；失败记 warn 与计数，不 panic。
+- 单次写超时 `storage_timeout=2s`；失败记 warn，不 panic。调用方 ctx 超时只表示停止等待，排队操作仍可能已提交；需要确定性时以重启后的存储状态为准。
 - 表数据持久性随 Storage 后端：`memory` 后端重启后表为空，`sqlite`/`mysql` 保留。
 
 文档行 `d:<id32>` 是知识库的提交点，一致性、崩溃与回收语义见 §4.7。
@@ -362,13 +373,13 @@ KV 逻辑键（全部）：
 - 首条消息到达时异步读取 `session:<hash>`。
 - 生成前最多等待 1s；仍未返回则按默认 `disabled=false` 继续，并 warn。
 - 等待期间 Handler 已经把消息写入内存历史，不丢消息。
-- 懒加载结果只覆盖 `disabled` 与 `updated_at`；历史与计数器不持久化。
+- 懒加载只应用 `disabled`；`updated_at` 仅作为 KV 审计字段，不写入会话状态。历史与计数器不持久化。
 
 ### 4.6 写穿透
 
 - `policy`、`admins`、`session` 与 `vector` 表的全部 `m:`/`d:`/`c:`/`meta` 行走同一写队列。
 - 提交顺序即执行顺序；单个写操作带 `storage_timeout=2s` 超时。
-- 写失败只记 warn 与计数，不回滚内存状态；重启后以最后一次成功写入为准。
+- 写失败只记 warn，不回滚内存状态；重启后以最后一次成功写入为准。
 - 命令输出不等待持久化成功，避免 Handler 被慢存储阻塞。
 - 行写入用 §4.4 的 `putRow` 语义；破坏性删除用 `DeleteRow`。
 

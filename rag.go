@@ -32,7 +32,7 @@ func (p *Plugin) retrieveRAG(ctx context.Context, s *sessionState, batch []Turn,
 	if !memoryActive && !knowledgeActive {
 		return ragResult{Status: "disabled"}
 	}
-	state := p.idx.waitReady(ctx, vectorReadyTimeout)
+	state := p.idx.waitReady(ctx, p.vectorReadyTimeout)
 	if state == vectorStateDisabled {
 		return ragResult{Status: "disabled"}
 	}
@@ -45,7 +45,7 @@ func (p *Plugin) retrieveRAG(ctx context.Context, s *sessionState, batch []Turn,
 	}
 	vecs, err := p.embedder.Embed(ctx, []string{query})
 	if err != nil {
-		p.log.Warn("rag embedding failed", "operation", "generate", "reason", "rag_status", "error", err.Error())
+		p.log.Warn("rag embedding failed", "operation", "generate", "rag_status", "error", "error", err.Error())
 		return ragResult{Status: "error"}
 	}
 	if len(vecs) != 1 {

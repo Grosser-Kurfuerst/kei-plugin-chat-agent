@@ -134,7 +134,7 @@ func TestVectorBadRowsSkipped(t *testing.T) {
 	seedRow(t, store, "x:unknown", []byte(`{}`))
 	seedMemory(t, store, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "channel", "g", "ok", "test-embed", []float32{1, 0, 0, 0}, 0.5)
 	env := newTestEnvWithStore(t, store, map[string]any{"random_enabled": false})
-	if env.p.idx.memoryRows() != 1 {
+	if env.p.idx.memoryRows() != 2 {
 		t.Fatalf("memory rows=%d", env.p.idx.memoryRows())
 	}
 	if _, ok := store.row(tableName, "x:unknown"); !ok {

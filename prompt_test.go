@@ -187,6 +187,10 @@ func TestCleanReply(t *testing.T) {
 	if skipped || text != "ok  then" {
 		t.Fatalf("token removal text=%q skip=%v", text, skipped)
 	}
+	text, skipped, _ = cleanReply("foo[SKIP]bar", true, cfg)
+	if skipped || text != "foo[SKIP]bar" {
+		t.Fatalf("embedded token changed text=%q skip=%v", text, skipped)
+	}
 	text, skipped, _ = cleanReply("[SKIP]", false, cfg)
 	if skipped || text != "[SKIP]" {
 		t.Fatal("addressed rounds must not interpret skip token")

@@ -90,10 +90,8 @@ func TestRAGStatuses(t *testing.T) {
 		}
 	})
 	t.Run("loading", func(t *testing.T) {
-		old := vectorReadyTimeout
-		vectorReadyTimeout = 5 * time.Millisecond
-		defer func() { vectorReadyTimeout = old }()
 		env := ragEnv(t, nil)
+		env.p.vectorReadyTimeout = 5 * time.Millisecond
 		env.p.idx.mu.Lock()
 		env.p.idx.state = vectorStateLoading
 		env.p.idx.mu.Unlock()

@@ -101,6 +101,7 @@ func TestDecisionFilterReasons(t *testing.T) {
 		_ = env.p.handleGroupMessage(context.Background(), atEvent("e1", "u", "hello", "g", "bot"), bot.NewNoopReply())
 		env.timers.fireLast()
 		env.bot.waitSends(1, time.Second)
+		waitLog(t, env.logs, "operation=generate")
 		_ = env.p.handleGroupMessage(context.Background(), atEvent("e2", "u", "again", "g", "bot"), bot.NewNoopReply())
 		waitLog(t, env.logs, "reason=cooldown")
 		if len(env.bot.sendsSnapshot()) != 1 {
@@ -220,6 +221,7 @@ func TestAddressing(t *testing.T) {
 		if len(env.bot.waitSends(1, time.Second)) != 1 {
 			t.Fatal("no first reply")
 		}
+		waitLog(t, env.logs, "operation=generate")
 		// fakeBot 返回 sent-1；引用它应寻址。
 		_ = env.p.handleGroupMessage(context.Background(), replyEvent("e2", "v", "follow up", "g", "sent-1"), bot.NewNoopReply())
 		env.timers.fireLast()
@@ -391,7 +393,7 @@ func TestBatchSortedBySeq(t *testing.T) {
 	s.firstAt = env.p.now()
 	s.mu.Unlock()
 	env.chat.replies = []string{"ok"}
-	env.p.onBatchTimer(s, s.epoch)
+	env.p.onBatchTimer(s, s.epoch, s.timerSeq)
 	if len(env.bot.waitSends(1, time.Second)) != 1 {
 		t.Fatal("no reply")
 	}
@@ -484,7 +486,7 @@ func TestSemaphoreFullAndStale(t *testing.T) {
 	}
 
 	s := env.p.getOrCreateSession(atEvent("x", "u", "hello", "g", "bot"))
-	env.p.onBatchTimer(s, s.epoch+1)
+	env.p.onBatchTimer(s, s.epoch+1, s.timerSeq)
 	waitLog(t, env.logs, "reason=stale")
 }
 
@@ -522,6 +524,7 @@ func TestReplyCleaningAndErrors(t *testing.T) {
 		_ = env.p.handleGroupMessage(context.Background(), atEvent("e1", "u", "one", "g", "bot"), bot.NewNoopReply())
 		env.timers.fireLast()
 		env.bot.waitSends(1, time.Second)
+		waitLog(t, env.logs, "operation=generate")
 		_ = env.p.handleGroupMessage(context.Background(), atEvent("e2", "u", "two", "g", "bot"), bot.NewNoopReply())
 		env.timers.fireLast()
 		waitLog(t, env.logs, "reason=duplicate_reply")
@@ -587,4 +590,29 @@ func TestImageAdmissionAndHistory(t *testing.T) {
 			t.Fatal("image message with short text should pass")
 		}
 	})
+}
+
+func TestReplyQuoteUsesMessageID(t *testing.T) {
+	env := newTestEnv(t, map[string]any{"random_enabled": false, "reply_quote": true})
+	env.chat.replies = []string{"ok"}
+	ev := atEvent("event-1", "u", "hello", "g", "bot")
+	ev.Message.ID = "message-1"
+	_ = env.p.handleGroupMessage(context.Background(), ev, bot.NewNoopReply())
+	env.timers.fireLast()
+	sent := env.bot.waitSends(1, time.Second)
+	if len(sent) != 1 {
+		t.Fatal("no reply")
+	}
+	found := false
+	for _, seg := range sent[0].msg.Segments {
+		if seg.Type == bot.SegReply {
+			found = true
+			if got := bot.SegmentData(seg, bot.KeyMessageID); got != "message-1" {
+				t.Fatalf("quote id = %q, want message-1", got)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("reply quote segment missing")
+	}
 }

@@ -3,18 +3,21 @@ package chatagent
 import (
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Turn 是一条会话历史记录。
 type Turn struct {
-	Seq      uint64
-	Time     time.Time
-	UserID   string
-	UserName string
-	Text     string
-	Images   []string
-	IsSelf   bool
-	EventID  string
+	Seq       uint64
+	Time      time.Time
+	UserID    string
+	UserName  string
+	Text      string
+	Images    []string
+	IsSelf    bool
+	EventID   string
+	MessageID string
+	IsBot     bool
 }
 
 // replyFingerprint 是机器人回复文本与时间的去重记录。
@@ -25,9 +28,10 @@ type replyFingerprint struct {
 
 // senderMark 是活动窗口内的非机器人发送者标记。
 type senderMark struct {
-	ID   string
-	Name string
-	At   time.Time
+	ID    string
+	Name  string
+	IsBot bool
+	At    time.Time
 }
 
 const (
@@ -39,9 +43,14 @@ const (
 	replyDedupeLimit = 5
 )
 
-// appendUserTurn 在会话历史中追加一条用户消息，并返回该 Turn。
-// 调用方必须保证会话未禁用且消息已通过准入。
+// appendUserTurn 追加一条普通用户消息；messageID 与 bot 标记由生产路径补充。
 func (p *Plugin) appendUserTurn(s *sessionState, text string, images []string, evUserID, evUserName, eventID string, at time.Time) Turn {
+	return p.appendUserTurnWithMeta(s, text, images, evUserID, evUserName, eventID, "", false, at)
+}
+
+// appendUserTurnWithMeta 在会话历史中追加一条用户消息，并返回该 Turn。
+// 调用方必须保证会话未禁用且消息已通过准入。
+func (p *Plugin) appendUserTurnWithMeta(s *sessionState, text string, images []string, evUserID, evUserName, eventID, messageID string, isBot bool, at time.Time) Turn {
 	if at.IsZero() {
 		at = p.now()
 	}
@@ -49,19 +58,21 @@ func (p *Plugin) appendUserTurn(s *sessionState, text string, images []string, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	turn := Turn{
-		Seq:      s.seq,
-		Time:     at,
-		UserID:   evUserID,
-		UserName: evUserName,
-		Text:     text,
-		Images:   append([]string(nil), images...),
-		EventID:  eventID,
+		Seq:       s.seq,
+		Time:      at,
+		UserID:    evUserID,
+		UserName:  evUserName,
+		Text:      text,
+		Images:    append([]string(nil), images...),
+		EventID:   eventID,
+		MessageID: messageID,
+		IsBot:     isBot,
 	}
 	s.seq++
 	s.history = append(s.history, turn)
 	p.trimHistoryLocked(s)
 	s.lastActivity = at
-	p.markSenderLocked(s, evUserID, evUserName, at)
+	p.markSenderLocked(s, evUserID, evUserName, isBot, at)
 	return turn
 }
 
@@ -71,13 +82,14 @@ func (p *Plugin) appendSelfTurn(s *sessionState, text, userID, eventID string, r
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	turn := Turn{
-		Seq:      s.seq,
-		Time:     now,
-		UserID:   userID,
-		UserName: p.cfg.BotName,
-		Text:     text,
-		IsSelf:   true,
-		EventID:  eventID,
+		Seq:       s.seq,
+		Time:      now,
+		UserID:    userID,
+		UserName:  p.cfg.BotName,
+		Text:      text,
+		IsSelf:    true,
+		EventID:   eventID,
+		MessageID: eventID,
 	}
 	s.seq++
 	s.history = append(s.history, turn)
@@ -185,8 +197,8 @@ func (s *sessionState) hasRecentReplyID(id string) bool {
 	return false
 }
 
-// markSenderLocked 记录非机器人发送者；调用方必须持有 s.mu。
-func (p *Plugin) markSenderLocked(s *sessionState, id, name string, now time.Time) {
+// markSenderLocked 记录活动发送者及其 bot 标记；调用方必须持有 s.mu。
+func (p *Plugin) markSenderLocked(s *sessionState, id, name string, isBot bool, now time.Time) {
 	if id == "" {
 		return
 	}
@@ -194,11 +206,12 @@ func (p *Plugin) markSenderLocked(s *sessionState, id, name string, now time.Tim
 	for i := range s.recentSenders {
 		if s.recentSenders[i].ID == id {
 			s.recentSenders[i].Name = name
+			s.recentSenders[i].IsBot = isBot
 			s.recentSenders[i].At = now
 			return
 		}
 	}
-	s.recentSenders = append(s.recentSenders, senderMark{ID: id, Name: name, At: now})
+	s.recentSenders = append(s.recentSenders, senderMark{ID: id, Name: name, IsBot: isBot, At: now})
 }
 
 // pruneSendersLocked 丢弃活动窗口外的发送者。
@@ -234,6 +247,9 @@ func (p *Plugin) pruneHourlyLocked(s *sessionState, now time.Time) {
 func (s *sessionState) participantCountLocked() int {
 	seen := make(map[string]struct{}, len(s.recentSenders))
 	for _, m := range s.recentSenders {
+		if m.IsBot {
+			continue
+		}
 		seen[m.ID] = struct{}{}
 	}
 	return len(seen)
@@ -256,7 +272,7 @@ func normalizeReplyText(s string) string {
 	var b strings.Builder
 	space := false
 	for _, r := range s {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+		if unicode.IsSpace(r) {
 			space = true
 			continue
 		}
