@@ -20,6 +20,7 @@
 | [`admin.md`](admin.md) | 14 | 超级管理员与核心管理员、命令面、输出、持久化、审计 |
 | [`testing.md`](testing.md) | 15 | 质量门、单测矩阵（含图片）、注入缝、mock 适配器端到端、竞态与关闭、文档校验 |
 | [`roadmap.md`](roadmap.md) | 16 | 交付状态、P1-P8、已知缺口、假设与兜底 |
+| [`refactoring/README.md`](refactoring/README.md) | — | 模块化重构方案、职责边界、子包迁移、规模预估与验收 |
 
 ## 阅读顺序
 
@@ -34,6 +35,8 @@
 9. [`admin.md`](admin.md)：核对两套管理员身份、命令语法、输出与恢复路径。
 10. [`testing.md`](testing.md)：核对质量门、测试矩阵、端到端场景与完成定义。
 11. [`roadmap.md`](roadmap.md)：核对当前状态、实现阶段、已知缺口与假设。
+
+进行模块化整理时，阅读 [`refactoring/README.md`](refactoring/README.md)，按职责整理与子包迁移两个阶段实施。
 
 ## 文档约定
 
